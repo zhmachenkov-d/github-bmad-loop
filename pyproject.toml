@@ -1,0 +1,31 @@
+[project]
+name = "github-bmad-loop"
+version = "0.1.0"
+description = "GitHub App + Slack BMAD orchestration factory control plane"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "psycopg[binary]>=3.3,<3.4",
+    "sqlalchemy>=2.0,<3",
+    "alembic>=1.20,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+bmad-worker = "apps.worker.__main__:main"
+bmad-outbox = "apps.outbox.__main__:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
