@@ -13,6 +13,22 @@ permissions:
 jobs:
   mutmut-full:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: bmad
+          POSTGRES_PASSWORD: bmad
+          POSTGRES_DB: bmad
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bmad -d bmad"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql://bmad:bmad@localhost:5432/bmad
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
