@@ -1,4 +1,7 @@
-"""Run one stub unit cycle: lease → apply. Idle exit when the queue is empty."""
+"""Run one stub unit cycle: lease → apply.
+
+Exit codes: 0 applied, 1 lease lost, 2 idle (empty queue or terminal no-op).
+"""
 
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ def run_once(worker_id: str | None = None) -> int:
         lease = store.lease_next_unit_job(worker_id)
         if lease is None:
             print("no actionable unit job", file=sys.stderr)
-            return 0
+            return 2
         try:
             result = store.apply_stub_transition(lease, worker_id)
         except LeaseLostError as exc:
@@ -27,9 +30,9 @@ def run_once(worker_id: str | None = None) -> int:
                 f"applied {result.from_state}→{result.to_state} "
                 f"key={result.idempotency_key}"
             )
-        else:
-            print("apply no-op (unit already terminal)")
-        return 0
+            return 0
+        print("apply no-op (unit already terminal)", file=sys.stderr)
+        return 2
 
 
 def main() -> None:

@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: bmad
       POSTGRES_DB: bmad
     ports:
-      - "5432:5432"
+      # Local-only bind; default bmad/bmad credentials are for compose dev, not shared hosts.
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bmad -d bmad"]
       interval: 2s

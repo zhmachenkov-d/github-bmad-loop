@@ -6,8 +6,6 @@ from datetime import timedelta
 from uuid import uuid4
 
 import psycopg
-from psycopg.types.json import Jsonb
-
 from core.stub_unit import (
     STUB_DONE,
     STUB_EVENT_TYPE,
@@ -18,12 +16,15 @@ from core.stub_unit import (
     UnitJobLease,
     outbox_idempotency_key,
 )
+from psycopg.types.json import Jsonb
 
 LEASE_TTL = timedelta(seconds=90)
 
 
 class PostgresJobStore:
-    def __init__(self, conn: psycopg.Connection, *, lease_ttl: timedelta = LEASE_TTL) -> None:
+    def __init__(
+        self, conn: psycopg.Connection, *, lease_ttl: timedelta = LEASE_TTL
+    ) -> None:
         self._conn = conn
         self._lease_ttl = lease_ttl
 
@@ -42,7 +43,7 @@ class PostgresJobStore:
                   AND u.state = %s
                   AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now())
                 ORDER BY j.created_at ASC
-                FOR UPDATE OF j SKIP LOCKED
+                FOR UPDATE OF j, u SKIP LOCKED
                 LIMIT 1
                 """,
                 (STUB_READY,),
@@ -92,8 +93,25 @@ class PostgresJobStore:
             if unit is None:
                 raise LeaseLostError("unit missing")
 
-            # Terminal unit: forced second apply is a no-op (no side effects).
+            if unit["run_id"] != lease.run_id:
+                raise LeaseLostError("run_id mismatch")
+
+            # Terminal unit: clear a matching held lease, then no-op (no side effects).
             if unit["state"] == STUB_DONE:
+                self._conn.execute(
+                    """
+                    UPDATE jobs
+                    SET lease_id = NULL,
+                        leased_by = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = now()
+                    WHERE id = %s
+                      AND lease_id = %s
+                      AND kind = 'unit'
+                      AND ref_id = %s
+                    """,
+                    (lease.job_id, lease.lease_id, lease.unit_id),
+                )
                 return StubTransition(
                     applied=False,
                     from_state=STUB_DONE,
@@ -116,22 +134,35 @@ class PostgresJobStore:
                 WHERE id = %s
                   AND version = %s
                   AND lease_id = %s
+                  AND leased_by = %s
+                  AND kind = 'unit'
+                  AND ref_id = %s
                 RETURNING version
                 """,
-                (lease.job_id, lease.job_version, lease.lease_id),
+                (
+                    lease.job_id,
+                    lease.job_version,
+                    lease.lease_id,
+                    worker_id,
+                    lease.unit_id,
+                ),
             ).fetchone()
             if job is None:
                 raise LeaseLostError("job version or lease mismatch")
 
-            self._conn.execute(
+            updated_unit = self._conn.execute(
                 """
                 UPDATE units
                 SET state = %s, updated_at = now()
                 WHERE id = %s AND state = %s
+                RETURNING id
                 """,
                 (STUB_DONE, lease.unit_id, STUB_READY),
-            )
+            ).fetchone()
+            if updated_unit is None:
+                raise LeaseLostError("unit state changed under lease")
 
+            run_id = unit["run_id"]
             self._conn.execute(
                 """
                 INSERT INTO event_log (
@@ -140,7 +171,7 @@ class PostgresJobStore:
                 VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    lease.run_id,
+                    run_id,
                     lease.unit_id,
                     STUB_READY,
                     STUB_DONE,
@@ -163,7 +194,7 @@ class PostgresJobStore:
                 ON CONFLICT (idempotency_key) DO NOTHING
                 """,
                 (
-                    lease.run_id,
+                    run_id,
                     lease.unit_id,
                     STUB_OUTBOX_CHANNEL,
                     key,
@@ -187,18 +218,21 @@ class PostgresJobStore:
             )
 
     def mark_outbox_sent(self, *, limit: int = 20) -> int:
+        if limit < 1:
+            return 0
         with self._conn.transaction():
             rows = self._conn.execute(
                 """
                 SELECT id
                 FROM outbox
                 WHERE status = 'pending'
+                  AND channel = %s
                   AND next_attempt_at <= now()
                 ORDER BY id
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
                 """,
-                (limit,),
+                (STUB_OUTBOX_CHANNEL, limit),
             ).fetchall()
             if not rows:
                 return 0
