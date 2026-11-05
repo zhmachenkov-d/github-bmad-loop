@@ -1,5 +1,9 @@
 # github-bmad-loop
 
+[![pytest](https://img.shields.io/github/actions/workflow/status/zhmachenkov-d/github-bmad-loop/ci.yml?branch=main&label=pytest)](https://github.com/zhmachenkov-d/github-bmad-loop/actions/workflows/ci.yml)
+[![Semgrep](https://img.shields.io/github/actions/workflow/status/zhmachenkov-d/github-bmad-loop/quality-pr.yml?branch=main&label=Semgrep)](https://github.com/zhmachenkov-d/github-bmad-loop/actions/workflows/quality-pr.yml)
+[![mutmut](https://img.shields.io/github/actions/workflow/status/zhmachenkov-d/github-bmad-loop/quality-mutmut-schedule.yml?branch=main&label=mutmut)](https://github.com/zhmachenkov-d/github-bmad-loop/actions/workflows/quality-mutmut-schedule.yml)
+
 GitHub App + Slack BMAD orchestration factory. Control plane is PostgreSQL with leased workers and a transactional outbox.
 
 ## Quick start (dev)
