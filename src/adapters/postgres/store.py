@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
 from uuid import uuid4
 
 import psycopg
+from psycopg.types.json import Jsonb
+
 from core.stub_unit import (
     STUB_DONE,
     STUB_EVENT_TYPE,
@@ -16,14 +19,16 @@ from core.stub_unit import (
     UnitJobLease,
     outbox_idempotency_key,
 )
-from psycopg.types.json import Jsonb
 
 LEASE_TTL = timedelta(seconds=90)
 
 
 class PostgresJobStore:
     def __init__(
-        self, conn: psycopg.Connection, *, lease_ttl: timedelta = LEASE_TTL
+        self,
+        conn: psycopg.Connection[dict[str, Any]],
+        *,
+        lease_ttl: timedelta = LEASE_TTL,
     ) -> None:
         self._conn = conn
         self._lease_ttl = lease_ttl

@@ -17,8 +17,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from adapters.postgres import database_url  # noqa: E402
-from core.stub_unit import STUB_READY  # noqa: E402
+from core.stub_unit import STUB_READY
 
 DEFAULT_URL = "postgresql://bmad:bmad@127.0.0.1:5432/bmad"
 

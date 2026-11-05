@@ -8,6 +8,9 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
 from adapters.postgres import PostgresJobStore
 from core.stub_unit import (
     STUB_DONE,
@@ -18,8 +21,6 @@ from core.stub_unit import (
     UnitJobLease,
     outbox_idempotency_key,
 )
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 
 
 def test_happy_path(conn, db_url, seed_unit_job, counts):
@@ -191,7 +192,7 @@ def test_lease_mismatch_raises(conn, seed_unit_job, counts):
 
 
 def test_run_id_mismatch_raises(conn, seed_unit_job, counts):
-    ids = seed_unit_job()
+    seed_unit_job()
     store = PostgresJobStore(conn)
     lease = store.lease_next_unit_job("w")
     assert lease is not None
