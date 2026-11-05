@@ -1,0 +1,157 @@
+# Product-repo PR/push quality: Semgrep + diff-scoped mutmut + SARIF upload.
+# Semgrep worsen vs baseline fails the job and posts one aggregated Slack.
+# Diff mutmut: run + SARIF only (no survivor / full-score gate).
+# Everyday ruff/mypy/pytest stay in ci.yml (story 10) — not duplicated here.
+name: quality-pr
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: bmad
+          POSTGRES_PASSWORD: bmad
+          POSTGRES_DB: bmad
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bmad -d bmad"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgresql://bmad:bmad@localhost:5432/bmad
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --frozen --extra dev
+
+      - name: Resolve Semgrep baseline commit
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BEFORE="$(git rev-parse HEAD~1)"
+            fi
+            echo "sha=$BEFORE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Semgrep (diff-aware) + baseline compare
+        id: semgrep
+        continue-on-error: true
+        run: |
+          BASE="${{ steps.base.outputs.sha }}"
+          EXTRA=()
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            EXTRA=(--baseline-commit="$BASE")
+          fi
+          set +e
+          uv run python .ci/run_semgrep.py "${EXTRA[@]}" --compare-baseline
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Upload Semgrep SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9418214df1f2c4b8128c770156c409013b07d6b9 # v3.39.3
+        with:
+          sarif_file: .ci/out/semgrep.sarif
+          category: semgrep
+
+      - name: Diff-scoped mutmut + SARIF
+        id: mutmut
+        continue-on-error: true
+        run: |
+          BASE="${{ steps.base.outputs.sha }}"
+          EXTRA=()
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            EXTRA=(--base-ref="$BASE")
+          fi
+          set +e
+          uv run python .ci/run_mutmut_diff.py "${EXTRA[@]}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Upload mutmut (diff) SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@9418214df1f2c4b8128c770156c409013b07d6b9 # v3.39.3
+        with:
+          sarif_file: .ci/out/mutmut-diff.sarif
+          category: mutmut-diff
+
+      - name: Build aggregated Slack payload (Semgrep worsen only on PR/push)
+        id: slack
+        if: always()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          set +e
+          uv run python .ci/slack_notify.py \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --server-url "${{ github.server_url }}" \
+            --repo "${{ github.repository }}" \
+            --sha "${{ github.sha }}" \
+            --worsen .ci/out/semgrep-worsen.json \
+            --output .ci/out/slack-payload.json
+          set -e
+          # secrets context is not allowed in step `if:`; gate here via env instead
+          if [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ] \
+            && [ -f .ci/out/slack-payload.json ] && grep -q '"text"' .ci/out/slack-payload.json; then
+            echo "should_notify=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_notify=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack on worsen
+        if: always() && steps.slack.outputs.should_notify == 'true'
+        continue-on-error: true
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: .ci/out/slack-payload.json
+          payload-templated: false
+
+      - name: Fail job on Semgrep worsen or tool crash
+        if: always()
+        run: |
+          SE="${{ steps.semgrep.outputs.exit_code }}"
+          MU="${{ steps.mutmut.outputs.exit_code }}"
+          echo "semgrep exit=$SE mutmut exit=$MU"
+          # Semgrep: 0 clean, 2 worsen, other = tool crash
+          # Mutmut diff: 0 ok (survivors allowed), non-zero = tool crash
+          if [ "$SE" != "0" ] || [ "$MU" != "0" ]; then
+            exit 1
+          fi
