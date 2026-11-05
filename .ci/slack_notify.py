@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 from lib import OUT_DIR, ensure_out_dir, load_json, write_json
 
 SURVIVOR_CAP = 30
-CHANNEL_TEMPLATE = "${{ secrets.SLACK_CHANNEL_ID }}"
+CHANNEL_PLACEHOLDER = "C_PLACEHOLDER"
 
 
 def short_mutant_id(mutant_id: str) -> str:
@@ -82,7 +83,8 @@ def build_payload(
             sha=sha,
         )
     )
-    return {"channel": CHANNEL_TEMPLATE, "text": "\n".join(lines)}
+    channel = os.environ.get("SLACK_CHANNEL_ID", "").strip() or CHANNEL_PLACEHOLDER
+    return {"channel": channel, "text": "\n".join(lines)}
 
 
 def collect_factors(worsen_paths: list[Path]) -> list[str]:
@@ -100,7 +102,8 @@ def collect_factors(worsen_paths: list[Path]) -> list[str]:
         elif tool == "mutmut":
             factors.append(
                 f"mutmut: score {data.get('baseline_score')} → {data.get('current_score')} "
-                f"(drop {data.get('drop')} ≥ {data.get('threshold', 1)})"
+                f"(drop {data.get('drop')}, survived_delta {data.get('survived_delta', 0)}, "
+                f"no_tests_delta {data.get('no_tests_delta', 0)})"
             )
         else:
             factors.append(f"{tool}: worsened")

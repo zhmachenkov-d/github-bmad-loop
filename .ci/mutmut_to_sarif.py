@@ -36,6 +36,10 @@ def _level(status: str) -> str:
     return "none"
 
 
+# Only export actionable statuses to Code Scanning (avoid note spam).
+_SARIF_STATUSES = frozenset({"survived", "no_tests", "suspicious"})
+
+
 def collect_results(paths_filter: set[str] | None) -> list[dict]:
     mutants_root = REPO_ROOT / "mutants"
     results: list[dict] = []
@@ -51,6 +55,8 @@ def collect_results(paths_filter: set[str] | None) -> list[dict]:
         payload = json.loads(meta_path.read_text(encoding="utf-8"))
         for key, exit_code in sorted(payload.get("exit_code_by_key", {}).items()):
             status = _status(exit_code)
+            if status not in _SARIF_STATUSES:
+                continue
             results.append(
                 {
                     "ruleId": f"mutmut/{status}",
@@ -83,34 +89,14 @@ def build_sarif(paths_filter: set[str] | None = None) -> dict:
             "defaultConfiguration": {"level": "warning"},
         },
         {
-            "id": "mutmut/killed",
-            "shortDescription": {"text": "Killed mutant"},
-            "defaultConfiguration": {"level": "note"},
-        },
-        {
             "id": "mutmut/no_tests",
             "shortDescription": {"text": "Mutant with no covering tests"},
-            "defaultConfiguration": {"level": "note"},
-        },
-        {
-            "id": "mutmut/timeout",
-            "shortDescription": {"text": "Mutant timed out"},
-            "defaultConfiguration": {"level": "note"},
-        },
-        {
-            "id": "mutmut/skipped",
-            "shortDescription": {"text": "Skipped mutant"},
             "defaultConfiguration": {"level": "note"},
         },
         {
             "id": "mutmut/suspicious",
             "shortDescription": {"text": "Suspicious mutant result"},
             "defaultConfiguration": {"level": "note"},
-        },
-        {
-            "id": "mutmut/not_checked",
-            "shortDescription": {"text": "Mutant not checked"},
-            "defaultConfiguration": {"level": "none"},
         },
     ]
     return sarif

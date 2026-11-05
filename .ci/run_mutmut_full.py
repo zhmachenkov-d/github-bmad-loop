@@ -25,7 +25,10 @@ def _export_stats() -> dict:
     run(["uv", "run", "mutmut", "export-cicd-stats"], check=True)
     from lib import REPO_ROOT
 
-    return load_json(REPO_ROOT / "mutants" / "mutmut-cicd-stats.json")
+    stats_path = REPO_ROOT / "mutants" / "mutmut-cicd-stats.json"
+    if not stats_path.is_file():
+        die(f"missing mutmut cicd stats: {stats_path}")
+    return load_json(stats_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,7 +77,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     write_json(OUT_DIR / "mutmut-score-current.json", current)
     write_json(args.sarif_output, build_sarif())
-    print(f"Mutation score: {score} (killed={current['killed']} survived={current['survived']} total={current['total']})")
+    print(
+        f"Mutation score: {score} (killed={current['killed']} survived={current['survived']} total={current['total']})"
+    )
     print(f"SARIF: {args.sarif_output}")
 
     if args.write_baseline:
@@ -90,20 +95,30 @@ def main(argv: list[str] | None = None) -> int:
 
     baseline = load_json(MUTMUT_BASELINE)
     baseline_score = int(baseline.get("score", 0))
+    baseline_survived = int(baseline.get("survived", 0))
+    baseline_no_tests = int(baseline.get("no_tests", 0))
     drop = baseline_score - score
-    survivors = collect_survived_mutants() if drop >= 1 else []
+    survived_up = current["survived"] - baseline_survived
+    no_tests_up = current["no_tests"] - baseline_no_tests
+    worsened = drop >= 1 or survived_up > 0 or no_tests_up > 0
+    survivors = collect_survived_mutants() if worsened else []
     worsen = {
         "tool": "mutmut",
-        "worsened": drop >= 1,
+        "worsened": worsened,
         "baseline_score": baseline_score,
         "current_score": score,
         "drop": drop,
         "threshold": 1,
+        "survived_delta": survived_up,
+        "no_tests_delta": no_tests_up,
         "survivors": survivors,
     }
     write_json(args.worsen_out, worsen)
-    if drop >= 1:
-        print(f"Mutmut worsen: score {baseline_score} → {score} (drop {drop} ≥ 1)")
+    if worsened:
+        print(
+            f"Mutmut worsen: score {baseline_score} → {score} "
+            f"(drop {drop}, survived_delta {survived_up}, no_tests_delta {no_tests_up})"
+        )
         return 2
     print(f"Mutmut baseline: clean or improved ({baseline_score} → {score})")
     return 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tomllib
@@ -18,6 +19,9 @@ OUT_DIR = CI_DIR / "out"
 SEMGREP_BASELINE = BASELINES_DIR / "semgrep-findings.json"
 MUTMUT_BASELINE = BASELINES_DIR / "mutmut-score.json"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+
+_MUTMUT_HEADER = re.compile(r"^\[tool\.mutmut\](\s|#|$)")
+
 
 def ensure_out_dir() -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,7 +46,9 @@ def git_changed_src_files(base_ref: str | None) -> list[str]:
     else:
         # Local hooks: staged + unstaged vs HEAD, plus untracked under src/
         cmd = ["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD"]
-    result = subprocess.run(cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+    result = subprocess.run(
+        cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True
+    )
     paths = {line.strip() for line in result.stdout.splitlines() if line.strip()}
     if not base_ref:
         staged = subprocess.run(
@@ -52,7 +58,9 @@ def git_changed_src_files(base_ref: str | None) -> list[str]:
             text=True,
             capture_output=True,
         )
-        paths.update(line.strip() for line in staged.stdout.splitlines() if line.strip())
+        paths.update(
+            line.strip() for line in staged.stdout.splitlines() if line.strip()
+        )
         untracked = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard", "src"],
             cwd=REPO_ROOT,
@@ -60,7 +68,9 @@ def git_changed_src_files(base_ref: str | None) -> list[str]:
             text=True,
             capture_output=True,
         )
-        paths.update(line.strip() for line in untracked.stdout.splitlines() if line.strip())
+        paths.update(
+            line.strip() for line in untracked.stdout.splitlines() if line.strip()
+        )
 
     return sorted(
         p
@@ -69,8 +79,8 @@ def git_changed_src_files(base_ref: str | None) -> list[str]:
     )
 
 
-def finding_id(check_id: str, path: str, message: str) -> str:
-    return f"{check_id}|{path}|{message}"
+def finding_id(check_id: str, path: str, start_line: int, message: str) -> str:
+    return f"{check_id}|{path}|{start_line}|{message}"
 
 
 def findings_from_semgrep_json(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -78,11 +88,13 @@ def findings_from_semgrep_json(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for item in payload.get("results", []):
         check_id = str(item.get("check_id", "unknown"))
         path = str(item.get("path", ""))
-        start_line = int(item.get("start", {}).get("line", 0))
-        message = str(item.get("extra", {}).get("message", ""))
+        start = item.get("start") or {}
+        extra = item.get("extra") or {}
+        start_line = int(start.get("line", 0) or 0)
+        message = str(extra.get("message", "") or "")
         findings.append(
             {
-                "id": finding_id(check_id, path, message),
+                "id": finding_id(check_id, path, start_line, message),
                 "check_id": check_id,
                 "path": path,
                 "start_line": start_line,
@@ -134,31 +146,38 @@ def collect_survived_mutants() -> list[dict[str, str]]:
 def temporary_only_mutate(patterns: list[str]) -> Iterator[None]:
     """Temporarily set ``[tool.mutmut].only_mutate`` in pyproject.toml."""
     original = PYPROJECT.read_text(encoding="utf-8")
-    data = tomllib.loads(original)
-    mutmut = data.setdefault("tool", {}).setdefault("mutmut", {})
-    mutmut["only_mutate"] = patterns
-    # Rewrite only the mutmut table section via a stable append/replace approach:
-    # keep original body and inject an only_mutate line under [tool.mutmut].
+    # Ensure table exists for validation even when we rewrite textually.
+    tomllib.loads(original)
     lines = original.splitlines(keepends=True)
     out: list[str] = []
     in_mutmut = False
     wrote = False
     for line in lines:
-        if line.strip() == "[tool.mutmut]":
+        stripped = line.strip()
+        if _MUTMUT_HEADER.match(stripped):
             in_mutmut = True
-            out.append(line)
+            out.append("[tool.mutmut]\n")
             continue
-        if in_mutmut and line.startswith("["):
+        if in_mutmut and stripped.startswith("["):
             if not wrote:
                 out.append("only_mutate = " + json.dumps(patterns) + "\n")
                 wrote = True
             in_mutmut = False
-        if in_mutmut and line.strip().startswith("only_mutate"):
+        if in_mutmut and stripped.startswith("only_mutate"):
             continue
         out.append(line)
     if in_mutmut and not wrote:
         out.append("only_mutate = " + json.dumps(patterns) + "\n")
-    PYPROJECT.write_text("".join(out), encoding="utf-8")
+        wrote = True
+    if not wrote:
+        if out and not out[-1].endswith("\n"):
+            out.append("\n")
+        out.append("\n[tool.mutmut]\n")
+        out.append("only_mutate = " + json.dumps(patterns) + "\n")
+    text = "".join(out)
+    if "only_mutate" not in text:
+        die("temporary_only_mutate failed to write only_mutate")
+    PYPROJECT.write_text(text, encoding="utf-8")
     try:
         yield
     finally:

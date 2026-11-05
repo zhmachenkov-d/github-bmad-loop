@@ -74,17 +74,29 @@ def main(argv: list[str] | None = None) -> int:
     # Semgrep exits 1 when findings exist; treat that as success for analysis.
     result = subprocess.run(cmd, cwd=REPO_ROOT, check=False, text=True)
     if result.returncode not in (0, 1):
-        die(f"semgrep failed with exit {result.returncode}", code=result.returncode or 1)
+        die(
+            f"semgrep failed with exit {result.returncode}", code=result.returncode or 1
+        )
 
     payload = load_json(args.json_output)
+    scan_mode = "diff-aware" if args.baseline_commit else "full"
+    if args.compare_baseline:
+        errors = payload.get("errors") or []
+        if errors:
+            die(f"semgrep reported {len(errors)} error(s); refusing baseline compare")
     findings = findings_from_semgrep_json(payload)
-    snapshot = {"findings": findings}
+    snapshot = {"findings": findings, "scan_mode": scan_mode}
     write_json(OUT_DIR / "semgrep-findings-current.json", snapshot)
-    print(f"Semgrep findings: {len(findings)}")
+    print(f"Semgrep findings: {len(findings)} (scan_mode={scan_mode})")
     print(f"SARIF: {args.sarif_output}")
+    if scan_mode == "diff-aware":
+        print(
+            "Note: current_count is the AST-diff slice, not a full-repo finding count",
+            flush=True,
+        )
 
     if args.write_baseline:
-        write_json(SEMGREP_BASELINE, snapshot)
+        write_json(SEMGREP_BASELINE, {"findings": findings})
         print(f"Wrote baseline {SEMGREP_BASELINE}")
         return 0
 
@@ -103,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         "new_findings": new,
         "baseline_count": len(known),
         "current_count": len(findings),
+        "scan_mode": scan_mode,
     }
     write_json(args.worsen_out, worsen)
     if new:

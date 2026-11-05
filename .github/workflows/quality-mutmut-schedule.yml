@@ -1,10 +1,14 @@
-# Scheduled full mutmut vs baseline; score drop ≥ 1 fails + one aggregated Slack.
+# Scheduled full mutmut vs baseline; score drop ≥ 1 or survived/no_tests growth fails + Slack.
 name: quality-mutmut-schedule
 
 on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -13,6 +17,7 @@ permissions:
 jobs:
   mutmut-full:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     services:
       postgres:
         image: postgres:18
@@ -53,7 +58,7 @@ jobs:
       - name: Upload mutmut (full) SARIF
         if: always()
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@9418214df1f2c4b8128c770156c409013b07d6b9 # v3.39.3
         with:
           sarif_file: .ci/out/mutmut-full.sarif
           category: mutmut-full
@@ -85,12 +90,12 @@ jobs:
       - name: Notify Slack on worsen
         if: always() && steps.slack.outputs.should_notify == 'true'
         continue-on-error: true
-        uses: slackapi/slack-github-action@v4
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload-file-path: .ci/out/slack-payload.json
-          payload-templated: true
+          payload-templated: false
 
       - name: Fail job on mutmut worsen or tool crash
         if: always()

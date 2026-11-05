@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from lib import (
     OUT_DIR,
+    collect_survived_mutants,
     die,
     ensure_out_dir,
     git_changed_src_files,
@@ -34,7 +36,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     ensure_out_dir()
 
-    changed = git_changed_src_files(args.base_ref)
+    try:
+        changed = git_changed_src_files(args.base_ref)
+    except Exception as exc:  # noqa: BLE001 — surface git failure clearly
+        die(f"git changed files failed: {exc}")
     if not changed:
         print("No changed src/ Python files; writing empty mutmut SARIF")
         write_json(args.sarif_output, build_sarif(set()))
@@ -54,7 +59,15 @@ def main(argv: list[str] | None = None) -> int:
         die(f"mutmut failed: {exc}")
 
     write_json(args.sarif_output, build_sarif(set(changed)))
-    print(f"SARIF: {args.sarif_output} (survivors do not fail this step)")
+    survivors = collect_survived_mutants()
+    print(
+        f"SARIF: {args.sarif_output} "
+        f"(survivors={len(survivors)}; survivors do not fail this step)"
+    )
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### Diff-scoped mutmut\n\nSurvivors: **{len(survivors)}**\n")
     return 0
 
 

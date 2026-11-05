@@ -97,7 +97,7 @@ uv run python .ci/run_semgrep.py --baseline-commit <base-sha>
 uv run python .ci/run_semgrep.py --compare-baseline
 # intentional bump only: uv run python .ci/run_semgrep.py --write-baseline
 
-# Mutmut (diff survivors do not fail; full score drop ≥ 1 fails vs baseline)
+# Mutmut (diff survivors do not fail; full: score drop ≥ 1 or survived/no_tests growth fails)
 uv run python .ci/run_mutmut_diff.py
 uv run python .ci/run_mutmut_diff.py --base-ref <base-sha>
 uv run python .ci/run_mutmut_full.py --compare-baseline
@@ -107,6 +107,6 @@ uv run python .ci/run_mutmut_full.py --compare-baseline
 uv run python .ci/run_worsen_fixture.py
 ```
 
-Baseline bump rule: see `.ci/README.md` — only edit `.ci/baselines/` when intentionally accepting a new Semgrep finding or a lower mutmut score. Hypothesis is a `dev` dependency for when property-based tests are earned later; not required on every change.
+Baseline bump rule: see `.ci/README.md` — only edit `.ci/baselines/` when intentionally accepting a new Semgrep finding or a lower mutmut score / higher survived or no_tests count. Hypothesis is a `dev` dependency for when property-based tests are earned later; not required on every change.
 
 Stack pins: Python 3.14, PostgreSQL 18, sync psycopg 3.3.x, SQLAlchemy 2.x + Alembic.
