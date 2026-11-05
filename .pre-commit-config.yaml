@@ -1,3 +1,4 @@
+# Keep `rev` equal to the locked `ruff` version in uv.lock (currently 0.17.3).
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.3
