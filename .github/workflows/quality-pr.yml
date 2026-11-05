@@ -1,4 +1,4 @@
-# Product-repo PR/push quality: Semgrep + diff-scoped mutmut + SARIF upload.
+# Product-repo PR quality (open/reopen/sync): Semgrep + diff-scoped mutmut + SARIF upload.
 # Semgrep worsen vs baseline fails the job and posts one aggregated Slack.
 # Diff mutmut: run + SARIF only (no survivor / full-score gate).
 # Everyday ruff/mypy/pytest stay in ci.yml (story 10) — not duplicated here.
@@ -6,8 +6,7 @@ name: quality-pr
 
 on:
   pull_request:
-  push:
-    branches: [main]
+    types: [opened, reopened, synchronize]
 
 concurrency:
   group: quality-${{ github.workflow }}-${{ github.ref }}
