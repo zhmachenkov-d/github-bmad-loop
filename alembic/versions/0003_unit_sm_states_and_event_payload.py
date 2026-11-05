@@ -44,6 +44,9 @@ def downgrade() -> None:
         ALTER TABLE event_log DROP COLUMN IF EXISTS payload;
 
         ALTER TABLE units DROP CONSTRAINT IF EXISTS units_state_check;
+        UPDATE units
+        SET state = 'stub_done'
+        WHERE state NOT IN ('stub_ready', 'stub_done');
         ALTER TABLE units
             ADD CONSTRAINT units_state_check
             CHECK (state IN ('stub_ready', 'stub_done'));

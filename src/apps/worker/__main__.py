@@ -30,7 +30,11 @@ def run_once(worker_id: str | None = None) -> int:
             return 2
         try:
             start = store.apply_transition(lease, worker_id, STUB_START)
-            lease = replace(lease, job_version=start.job_version_after)
+            lease = replace(
+                lease,
+                job_version=start.job_version_after,
+                unit_state=start.to_state,
+            )
             complete = store.apply_transition(lease, worker_id, STUB_COMPLETE)
         except (
             LeaseLostError,

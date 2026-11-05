@@ -9,9 +9,6 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
-
 from adapters.postgres import PostgresJobStore
 from apps.worker import __main__ as worker_main
 from core.stub_unit import (
@@ -27,6 +24,8 @@ from core.stub_unit import (
     UnitJobLease,
     outbox_idempotency_key,
 )
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 
 def test_happy_path(conn, db_url, seed_unit_job, counts):
@@ -40,7 +39,9 @@ def test_happy_path(conn, db_url, seed_unit_job, counts):
 
     start = store.apply_transition(lease, "worker-a", STUB_START)
     assert start.to_state == STUB_RUNNING
-    lease = replace(lease, job_version=start.job_version_after)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
     complete = store.apply_transition(lease, "worker-a", STUB_COMPLETE)
     assert complete.from_state == STUB_RUNNING
     assert complete.to_state == STUB_DONE
@@ -67,6 +68,8 @@ def test_happy_path(conn, db_url, seed_unit_job, counts):
     assert events[1]["event_type"] == STUB_COMPLETE
     assert events[1]["payload"]["effect"] == STUB_EFFECT
     assert events[1]["payload"]["result"] is None
+    assert events[1]["payload"]["job_version"] == lease.job_version
+    assert events[1]["payload"]["lease_id"] == str(lease.lease_id)
 
     outbox = conn.execute(
         "SELECT status, idempotency_key, channel, payload FROM outbox"
@@ -74,7 +77,12 @@ def test_happy_path(conn, db_url, seed_unit_job, counts):
     assert outbox["status"] == "pending"
     assert outbox["idempotency_key"] == expected_key
     assert outbox["channel"] == "stub"
-    assert outbox["payload"]["effect"] == STUB_EFFECT
+    assert outbox["payload"] == {
+        "effect": STUB_EFFECT,
+        "from_state": STUB_RUNNING,
+        "to_state": STUB_DONE,
+        "unit_id": str(ids["unit_id"]),
+    }
 
     conn.commit()
     marked = store.mark_outbox_sent()
@@ -94,13 +102,26 @@ def test_worker_run_once_exit_zero(conn, seed_unit_job, db_url):
         assert unit["state"] == STUB_DONE
 
 
+def test_worker_run_once_exit_one_on_apply_failure(conn, seed_unit_job, monkeypatch):
+    seed_unit_job()
+    conn.commit()
+
+    def boom(self, lease, worker_id, event, result=None):
+        raise LeaseLostError("forced apply failure")
+
+    monkeypatch.setattr(PostgresJobStore, "apply_transition", boom)
+    assert worker_main.run_once("worker-a") == 1
+
+
 def test_terminal_apply_illegal_not_noop(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
     lease = store.lease_next_unit_job("worker-a")
     assert lease is not None
     start = store.apply_transition(lease, "worker-a", STUB_START)
-    lease = replace(lease, job_version=start.job_version_after)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
     store.apply_transition(lease, "worker-a", STUB_COMPLETE)
     before = counts()
 
@@ -171,7 +192,9 @@ def test_expired_lease_reclaim(conn, seed_unit_job):
     assert reclaimed.lease_id != first.lease_id
 
     start = store.apply_transition(reclaimed, "w2", STUB_START)
-    lease = replace(reclaimed, job_version=start.job_version_after)
+    lease = replace(
+        reclaimed, job_version=start.job_version_after, unit_state=start.to_state
+    )
     complete = store.apply_transition(lease, "w2", STUB_COMPLETE)
     assert complete.to_state == STUB_DONE
 
@@ -223,7 +246,9 @@ def test_outbox_on_conflict_dedupe(conn, seed_unit_job, counts):
     assert lease is not None
     assert lease.job_version == 1
     start = store.apply_transition(lease, "w", STUB_START)
-    lease = replace(lease, job_version=start.job_version_after)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
     pre_key = outbox_idempotency_key(
         unit_id=ids["unit_id"],
         effect=STUB_EFFECT,
@@ -260,7 +285,9 @@ def test_mark_outbox_sent_stub_channel_only(conn, seed_unit_job, db_url):
     lease = store.lease_next_unit_job("w")
     assert lease is not None
     start = store.apply_transition(lease, "w", STUB_START)
-    lease = replace(lease, job_version=start.job_version_after)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
     store.apply_transition(lease, "w", STUB_COMPLETE)
     with conn.transaction():
         conn.execute(
@@ -303,7 +330,11 @@ def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
                     return
                 try:
                     start = store.apply_transition(lease, name, STUB_START)
-                    lease = replace(lease, job_version=start.job_version_after)
+                    lease = replace(
+                        lease,
+                        job_version=start.job_version_after,
+                        unit_state=start.to_state,
+                    )
                     complete = store.apply_transition(lease, name, STUB_COMPLETE)
                     results.append((name, complete))
                 except LeaseLostError as exc:
