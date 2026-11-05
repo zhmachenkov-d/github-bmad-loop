@@ -1,0 +1,86 @@
+# Scheduled full mutmut vs baseline; score drop ≥ 1 fails + one aggregated Slack.
+name: quality-mutmut-schedule
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  mutmut-full:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --frozen --extra dev
+
+      - name: Full mutmut + baseline compare
+        id: mutmut
+        run: |
+          set +e
+          uv run python .ci/run_mutmut_full.py --compare-baseline
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Upload mutmut (full) SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .ci/out/mutmut-full.sarif
+          category: mutmut-full
+
+      - name: Build aggregated Slack payload
+        id: slack
+        if: always()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          set +e
+          uv run python .ci/slack_notify.py \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --server-url "${{ github.server_url }}" \
+            --repo "${{ github.repository }}" \
+            --sha "${{ github.sha }}" \
+            --worsen .ci/out/mutmut-worsen.json \
+            --output .ci/out/slack-payload.json
+          set -e
+          # secrets context is not allowed in step `if:`; gate here via env instead
+          if [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ] \
+            && [ -f .ci/out/slack-payload.json ] && grep -q '"text"' .ci/out/slack-payload.json; then
+            echo "should_notify=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_notify=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack on worsen
+        if: always() && steps.slack.outputs.should_notify == 'true'
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v4
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: .ci/out/slack-payload.json
+          payload-templated: true
+
+      - name: Fail job on mutmut worsen or tool crash
+        if: always()
+        run: |
+          MU="${{ steps.mutmut.outputs.exit_code }}"
+          echo "mutmut exit=$MU"
+          if [ "$MU" != "0" ]; then
+            exit 1
+          fi

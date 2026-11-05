@@ -70,7 +70,9 @@ Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad
 
 Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/postgresql/data`). After pulling that compose change, reset the old volume once: `docker compose down -v` (destroys local DB data), then `docker compose up -d`.
 
-Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml` on `pull_request` and `push`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks). Keep `.pre-commit-config.yaml` `rev` equal to the locked `ruff` version in `uv.lock`.
+Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml` on `pull_request` and `push`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks). Keep `.pre-commit-config.yaml` `rev` equal to the locked `ruff` version in `uv.lock`. Pre-commit stays **ruff format only** — Semgrep and mutmut are not hooks.
+
+Quality bar CI (AD-15 / R16) lives in `.github/workflows/quality-pr.yml` (PR/push Semgrep + diff mutmut) and `.github/workflows/quality-mutmut-schedule.yml` (Monday / `workflow_dispatch` full mutmut). Glue under `.ci/` is not package code. Owner Slack on worsen uses `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` via `chat.postMessage` (not a webhook); missing secrets skip notify without failing the job.
 
 ```bash
 uv sync --frozen --extra dev
@@ -85,5 +87,26 @@ uv run python -m apps.worker       # exit 0 applied / 1 lease lost / 2 idle
 uv run python -m apps.outbox
 uv run pytest
 ```
+
+### Local verify quality
+
+```bash
+# Semgrep (AST-diff / baseline compare)
+uv run python .ci/run_semgrep.py
+uv run python .ci/run_semgrep.py --baseline-commit <base-sha>
+uv run python .ci/run_semgrep.py --compare-baseline
+# intentional bump only: uv run python .ci/run_semgrep.py --write-baseline
+
+# Mutmut (diff survivors do not fail; full score drop ≥ 1 fails vs baseline)
+uv run python .ci/run_mutmut_diff.py
+uv run python .ci/run_mutmut_diff.py --base-ref <base-sha>
+uv run python .ci/run_mutmut_full.py --compare-baseline
+# intentional bump only: uv run python .ci/run_mutmut_full.py --write-baseline
+
+# HITL worsen fixture (dry-run Slack payload; no secrets required)
+uv run python .ci/run_worsen_fixture.py
+```
+
+Baseline bump rule: see `.ci/README.md` — only edit `.ci/baselines/` when intentionally accepting a new Semgrep finding or a lower mutmut score. Hypothesis is a `dev` dependency for when property-based tests are earned later; not required on every change.
 
 Stack pins: Python 3.14, PostgreSQL 18, sync psycopg 3.3.x, SQLAlchemy 2.x + Alembic.

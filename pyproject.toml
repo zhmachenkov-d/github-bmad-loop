@@ -16,6 +16,9 @@ dev = [
     "ruff>=0.14",
     "mypy>=1.18",
     "pre-commit>=4.0",
+    "hypothesis>=6",
+    "mutmut>=3",
+    "semgrep>=1.90",
 ]
 
 [project.scripts]
@@ -42,3 +45,9 @@ python_version = "3.14"
 files = ["src"]
 mypy_path = "src"
 explicit_package_bases = true
+
+[tool.mutmut]
+source_paths = ["src"]
+# Alembic assets needed when tests run under mutants/ (mutmut does not copy them by default).
+also_copy = ["alembic.ini", "alembic"]
+pytest_add_cli_args_test_selection = ["tests"]
