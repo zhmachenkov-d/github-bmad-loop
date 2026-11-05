@@ -68,13 +68,20 @@ Do not copy the handoff `ai-factory/` tree verbatim.
 
 Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad` is local-dev). Override with `DATABASE_URL` outside that compose stack. Worker and outbox stay host-side one-shots for the tracer.
 
+Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks).
+
 ```bash
+uv sync --extra dev
+uv run pre-commit install          # ruff-format only
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy                        # files=["src"]; non-strict
 docker compose up -d
-alembic upgrade head
-python scripts/seed_dev.py   # truncates then seeds one cycle; --keep to append
-python -m apps.worker        # exit 0 applied / 1 lease lost / 2 idle
-python -m apps.outbox
-python -m pytest
+uv run alembic upgrade head
+uv run python scripts/seed_dev.py  # truncates then seeds one cycle; --keep to append
+uv run python -m apps.worker       # exit 0 applied / 1 lease lost / 2 idle
+uv run python -m apps.outbox
+uv run pytest
 ```
 
 Stack pins: Python 3.14, PostgreSQL 18, sync psycopg 3.3.x, SQLAlchemy 2.x + Alembic.
