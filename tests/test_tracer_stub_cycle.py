@@ -9,6 +9,9 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
 from adapters.postgres import PostgresJobStore
 from apps.worker import __main__ as worker_main
 from core.stub_unit import (
@@ -24,8 +27,6 @@ from core.stub_unit import (
     UnitJobLease,
     outbox_idempotency_key,
 )
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 
 
 def test_happy_path(conn, db_url, seed_unit_job, counts):

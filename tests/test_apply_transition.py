@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+
 from adapters.postgres import PostgresJobStore
 from core.stub_unit import (
     STUB_COMPLETE,
