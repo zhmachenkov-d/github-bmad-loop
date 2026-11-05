@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from uuid import uuid4
 
 import psycopg
@@ -12,11 +13,16 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from adapters.postgres import PostgresJobStore
+from apps.worker import __main__ as worker_main
 from core.stub_unit import (
+    STUB_COMPLETE,
     STUB_DONE,
-    STUB_EVENT_TYPE,
+    STUB_EFFECT,
     STUB_OUTBOX_CHANNEL,
     STUB_READY,
+    STUB_RUNNING,
+    STUB_START,
+    IllegalTransitionError,
     LeaseLostError,
     UnitJobLease,
     outbox_idempotency_key,
@@ -32,67 +38,96 @@ def test_happy_path(conn, db_url, seed_unit_job, counts):
     assert lease.unit_id == ids["unit_id"]
     assert lease.unit_state == STUB_READY
 
-    result = store.apply_stub_transition(lease, "worker-a")
-    assert result.applied is True
-    assert result.from_state == STUB_READY
-    assert result.to_state == STUB_DONE
-    expected_key = f"unit:{ids['unit_id']}:stub_transition:{lease.job_version}"
-    assert result.idempotency_key == expected_key
-    assert result.idempotency_key == outbox_idempotency_key(
+    start = store.apply_transition(lease, "worker-a", STUB_START)
+    assert start.to_state == STUB_RUNNING
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
+    complete = store.apply_transition(lease, "worker-a", STUB_COMPLETE)
+    assert complete.from_state == STUB_RUNNING
+    assert complete.to_state == STUB_DONE
+    expected_key = outbox_idempotency_key(
         unit_id=ids["unit_id"],
+        effect=STUB_EFFECT,
         transition_version=lease.job_version,
     )
+    assert complete.idempotency_key == expected_key
 
     unit = conn.execute(
         "SELECT state FROM units WHERE id = %s", (ids["unit_id"],)
     ).fetchone()
     assert unit["state"] == STUB_DONE
 
-    event = conn.execute(
-        "SELECT from_state, to_state, event_type, worker_id, run_id FROM event_log"
-    ).fetchone()
-    assert event["from_state"] == STUB_READY
-    assert event["to_state"] == STUB_DONE
-    assert event["event_type"] == STUB_EVENT_TYPE
-    assert event["worker_id"] == "worker-a"
-    assert event["run_id"] == ids["run_id"]
+    events = conn.execute(
+        """
+        SELECT from_state, to_state, event_type, worker_id, run_id, payload
+        FROM event_log ORDER BY id
+        """
+    ).fetchall()
+    assert len(events) == 2
+    assert events[0]["event_type"] == STUB_START
+    assert events[1]["event_type"] == STUB_COMPLETE
+    assert events[1]["payload"]["effect"] == STUB_EFFECT
+    assert events[1]["payload"]["result"] is None
+    assert events[1]["payload"]["job_version"] == lease.job_version
+    assert events[1]["payload"]["lease_id"] == str(lease.lease_id)
 
     outbox = conn.execute(
-        "SELECT status, idempotency_key, channel FROM outbox"
+        "SELECT status, idempotency_key, channel, payload FROM outbox"
     ).fetchone()
     assert outbox["status"] == "pending"
     assert outbox["idempotency_key"] == expected_key
     assert outbox["channel"] == "stub"
+    assert outbox["payload"] == {
+        "effect": STUB_EFFECT,
+        "from_state": STUB_RUNNING,
+        "to_state": STUB_DONE,
+        "unit_id": str(ids["unit_id"]),
+    }
 
-    # End implicit txn from SELECTs so mark_outbox_sent commits durably.
     conn.commit()
     marked = store.mark_outbox_sent()
     assert marked == 1
     with psycopg.connect(db_url, row_factory=dict_row) as other:
         sent = other.execute("SELECT status FROM outbox").fetchone()
         assert sent["status"] == "sent"
-    assert counts() == {"event_log": 1, "outbox": 1}
+    assert counts() == {"event_log": 2, "outbox": 1}
 
 
-def test_idempotent_reclaim(conn, seed_unit_job, counts):
+def test_worker_run_once_exit_zero(conn, seed_unit_job, db_url):
+    seed_unit_job()
+    conn.commit()
+    assert worker_main.run_once("worker-a") == 0
+    with psycopg.connect(db_url, row_factory=dict_row) as other:
+        unit = other.execute("SELECT state FROM units").fetchone()
+        assert unit["state"] == STUB_DONE
+
+
+def test_worker_run_once_exit_one_on_apply_failure(conn, seed_unit_job, monkeypatch):
+    seed_unit_job()
+    conn.commit()
+
+    def boom(self, lease, worker_id, event, result=None):
+        raise LeaseLostError("forced apply failure")
+
+    monkeypatch.setattr(PostgresJobStore, "apply_transition", boom)
+    assert worker_main.run_once("worker-a") == 1
+
+
+def test_terminal_apply_illegal_not_noop(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-
     lease = store.lease_next_unit_job("worker-a")
     assert lease is not None
-    store.apply_stub_transition(lease, "worker-a")
-    store.mark_outbox_sent()
+    start = store.apply_transition(lease, "worker-a", STUB_START)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
+    store.apply_transition(lease, "worker-a", STUB_COMPLETE)
     before = counts()
 
-    # Second claim: terminal unit → no actionable job.
     assert store.lease_next_unit_job("worker-b") is None
 
-    # Forced apply against a fabricated lease after clear: no-op on stub_done.
-    forced = store.apply_stub_transition(lease, "worker-forced")
-    assert forced.applied is False
-    assert counts() == before
-
-    # Even with a fresh lease row forged on a done unit, apply stays no-op and clears lease.
     forged_lease_id = uuid4()
     with conn.transaction():
         conn.execute(
@@ -108,7 +143,6 @@ def test_idempotent_reclaim(conn, seed_unit_job, counts):
     job = conn.execute(
         "SELECT version, lease_id FROM jobs WHERE id = %s", (ids["job_id"],)
     ).fetchone()
-
     forged = UnitJobLease(
         job_id=ids["job_id"],
         run_id=ids["run_id"],
@@ -117,16 +151,9 @@ def test_idempotent_reclaim(conn, seed_unit_job, counts):
         job_version=job["version"],
         unit_state=STUB_DONE,
     )
-    again = store.apply_stub_transition(forged, "worker-forced")
-    assert again.applied is False
+    with pytest.raises(IllegalTransitionError):
+        store.apply_transition(forged, "forger", STUB_START)
     assert counts() == before
-    cleared = conn.execute(
-        "SELECT lease_id, leased_by, lease_expires_at FROM jobs WHERE id = %s",
-        (ids["job_id"],),
-    ).fetchone()
-    assert cleared["lease_id"] is None
-    assert cleared["leased_by"] is None
-    assert cleared["lease_expires_at"] is None
 
 
 def test_empty_queue(conn, counts):
@@ -165,8 +192,12 @@ def test_expired_lease_reclaim(conn, seed_unit_job):
     assert reclaimed.unit_id == ids["unit_id"]
     assert reclaimed.lease_id != first.lease_id
 
-    result = store.apply_stub_transition(reclaimed, "w2")
-    assert result.applied is True
+    start = store.apply_transition(reclaimed, "w2", STUB_START)
+    lease = replace(
+        reclaimed, job_version=start.job_version_after, unit_state=start.to_state
+    )
+    complete = store.apply_transition(lease, "w2", STUB_COMPLETE)
+    assert complete.to_state == STUB_DONE
 
 
 def test_lease_mismatch_raises(conn, seed_unit_job, counts):
@@ -182,8 +213,8 @@ def test_lease_mismatch_raises(conn, seed_unit_job, counts):
         job_version=lease.job_version,
         unit_state=STUB_READY,
     )
-    with pytest.raises(LeaseLostError, match="job version or lease mismatch"):
-        store.apply_stub_transition(bad, "w")
+    with pytest.raises(LeaseLostError, match="lease_id mismatch"):
+        store.apply_transition(bad, "w", STUB_START)
     unit = conn.execute(
         "SELECT state FROM units WHERE id = %s", (ids["unit_id"],)
     ).fetchone()
@@ -205,15 +236,25 @@ def test_run_id_mismatch_raises(conn, seed_unit_job, counts):
         unit_state=STUB_READY,
     )
     with pytest.raises(LeaseLostError, match="run_id mismatch"):
-        store.apply_stub_transition(bad, "w")
+        store.apply_transition(bad, "w", STUB_START)
     assert counts() == {"event_log": 0, "outbox": 0}
 
 
 def test_outbox_on_conflict_dedupe(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    # Version after lease will be 1 (seed inserts version 0, lease bumps).
-    pre_key = outbox_idempotency_key(unit_id=ids["unit_id"], transition_version=1)
+    lease = store.lease_next_unit_job("w")
+    assert lease is not None
+    assert lease.job_version == 1
+    start = store.apply_transition(lease, "w", STUB_START)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
+    pre_key = outbox_idempotency_key(
+        unit_id=ids["unit_id"],
+        effect=STUB_EFFECT,
+        transition_version=lease.job_version,
+    )
     with conn.transaction():
         conn.execute(
             """
@@ -230,12 +271,8 @@ def test_outbox_on_conflict_dedupe(conn, seed_unit_job, counts):
                 Jsonb({"effect": "preseed"}),
             ),
         )
-    lease = store.lease_next_unit_job("w")
-    assert lease is not None
-    assert lease.job_version == 1
-    result = store.apply_stub_transition(lease, "w")
-    assert result.applied is True
-    assert counts() == {"event_log": 1, "outbox": 1}
+    store.apply_transition(lease, "w", STUB_COMPLETE)
+    assert counts() == {"event_log": 2, "outbox": 1}
     row = conn.execute(
         "SELECT payload->>'effect' AS effect FROM outbox WHERE idempotency_key = %s",
         (pre_key,),
@@ -248,7 +285,11 @@ def test_mark_outbox_sent_stub_channel_only(conn, seed_unit_job, db_url):
     store = PostgresJobStore(conn)
     lease = store.lease_next_unit_job("w")
     assert lease is not None
-    store.apply_stub_transition(lease, "w")
+    start = store.apply_transition(lease, "w", STUB_START)
+    lease = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
+    store.apply_transition(lease, "w", STUB_COMPLETE)
     with conn.transaction():
         conn.execute(
             """
@@ -272,7 +313,6 @@ def test_mark_outbox_sent_stub_channel_only(conn, seed_unit_job, db_url):
 
 
 def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
-    # seed via session conn, then race on separate connections
     ids = seed_unit_job()
     conn.commit()
 
@@ -290,8 +330,14 @@ def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
                     results.append((name, None))
                     return
                 try:
-                    applied = store.apply_stub_transition(lease, name)
-                    results.append((name, applied))
+                    start = store.apply_transition(lease, name, STUB_START)
+                    lease = replace(
+                        lease,
+                        job_version=start.job_version_after,
+                        unit_state=start.to_state,
+                    )
+                    complete = store.apply_transition(lease, name, STUB_COMPLETE)
+                    results.append((name, complete))
                 except LeaseLostError as exc:
                     errors.append((name, exc))
         except Exception as exc:  # noqa: BLE001
@@ -303,9 +349,7 @@ def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
             f.result(timeout=30)
 
     assert not errors, errors
-    winners = [
-        r for r in results if r[1] is not None and getattr(r[1], "applied", False)
-    ]
+    winners = [r for r in results if r[1] is not None]
     losers = [r for r in results if r[1] is None]
     assert len(winners) == 1, results
     assert len(losers) == 1, results
@@ -317,5 +361,5 @@ def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
         assert unit["state"] == STUB_DONE
         event_n = c.execute("SELECT count(*) AS n FROM event_log").fetchone()["n"]
         outbox_n = c.execute("SELECT count(*) AS n FROM outbox").fetchone()["n"]
-        assert event_n == 1
+        assert event_n == 2
         assert outbox_n == 1

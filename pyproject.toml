@@ -48,6 +48,6 @@ explicit_package_bases = true
 
 [tool.mutmut]
 source_paths = ["src"]
-# Alembic assets needed when tests run under mutants/ (mutmut does not copy them by default).
-also_copy = ["alembic.ini", "alembic"]
+# Assets needed when tests run under mutants/ (mutmut does not copy them by default).
+also_copy = ["alembic.ini", "alembic", ".ci"]
 pytest_add_cli_args_test_selection = ["tests"]
