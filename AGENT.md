@@ -14,20 +14,35 @@ Hexagonal control plane (architecture spine Structural Seed):
 - `alembic/` — schema migrations
 - `docker-compose.yml` — PostgreSQL 18 for local `dev`
 
-## Tracer stub (story 1.1)
+## Stub Unit SM (story 1.2)
 
-Stub Unit SM states live on **`units.state`**:
+States on **`units.state`** (CHECK widened in migration `0003`):
 
-| State        | Meaning                                |
-| ------------ | -------------------------------------- |
-| `stub_ready` | Actionable; unit jobs may be leased    |
-| `stub_done`  | Terminal for the tracer; not re-leased |
+| State           | Meaning                                              |
+| --------------- | ---------------------------------------------------- |
+| `stub_ready`    | Actionable; `lease_next` claims only this state      |
+| `stub_running`  | Work in progress under a held lease                  |
+| `stub_paused`   | Paused under a held lease                            |
+| `stub_done`     | Terminal success; lease cleared on entry             |
+| `stub_failed`   | Terminal failure; lease cleared on entry             |
 
-Transition: `stub_ready` → `stub_done` on event `stub_unit_complete`.
+Declared edges (anything else → `IllegalTransitionError`):
 
-`jobs` is the lease/work queue only (`kind` ∈ `{run,unit}`, `ref_id`, lease columns, `version`). It does **not** store SM state.
+| From            | Event            | To              | Outbox effect   |
+| --------------- | ---------------- | --------------- | --------------- |
+| `stub_ready`    | `stub_start`     | `stub_running`  | —               |
+| `stub_running`  | `stub_complete`  | `stub_done`     | `stub_effect`   |
+| `stub_running`  | `stub_pause`     | `stub_paused`   | `stub_notify`   |
+| `stub_paused`   | `stub_resume`    | `stub_running`  | —               |
+| `stub_running`  | `stub_fail`      | `stub_failed`   | `stub_effect`   |
 
-Story **1.2** owns the real Unit SM table and lease-guarded apply API in `core`/ports. Replace the stub transition in `adapters/postgres/store.py` — do not invent a parallel apply path.
+Normative table and errors live in `src/core/stub_unit.py`. `jobs` is the lease/work queue only (`kind` ∈ `{run,unit}`, `ref_id`, lease columns, `version`); it does **not** store SM state.
+
+**Apply (AD-12 subset):** `JobStorePort.apply_transition(lease, worker_id, event, result=None)` → `ApplyTransitionResult` with `job_version_after`. One transaction on the store-held connection: lease/version/`lease_expires_at > now()`/`leased_by` guards → enum state → table lookup. Guard order: `LeaseLostError` → `InvalidUnitStateError` → `IllegalTransitionError`. Non-`None` `result` → `UnsupportedResultError` before any write (story 1.2: always omit `result`).
+
+On success: bump `jobs.version` every apply; **retain** `lease_id` / `leased_by` / `lease_expires_at` on non-terminal targets; **clear** lease only on `stub_done` / `stub_failed`. Append `event_log` with `event_type` equal to the SM event string; JSONB `payload` keys `job_version` (pre-bump), `lease_id`, `effect`, `result` (always `null`). Optional outbox row when the edge carries an effect.
+
+**Worker (tracer):** one lease → `stub_start` → `dataclasses.replace(lease, job_version=…)` → `stub_complete`. Exit codes: `0` full cycle applied, `1` apply error (lease/SM), `2` idle (empty queue). No terminal no-op.
 
 ## Outbox (AD-16)
 
@@ -37,18 +52,18 @@ Idempotency key shape:
 aggregate_type:aggregate_id:effect_kind:dedupe_token
 ```
 
-Tracer example: `unit:{unit_id}:stub_transition:{job_version_at_lease}`.
+Stub examples: `unit:{unit_id}:stub_effect:{job_version_at_apply}` or `…:stub_notify:…` (pre-bump version observed on the lease).
 
 Inserts use `ON CONFLICT (idempotency_key) DO NOTHING`.
 
 The stub dispatcher marks **`channel = 'stub'`** `pending` → `sent` with **no** GitHub/Slack I/O. Non-stub pending rows are left untouched. This is **not** the production outbox (no retry, dead-letter, or real senders — story 1.4+).
 
-Integrity guards (story 1.1):
+Integrity guards:
 
-- `units.state` CHECK ∈ `{stub_ready, stub_done}`
+- `units.state` CHECK ∈ stub enum (see table above)
 - `UNIQUE (jobs.kind, jobs.ref_id)` — one leaseable job row per unit/run ref
-- Apply clears a matching job lease on terminal no-op; guards `leased_by`, `kind`, `ref_id`; attributes event/outbox from locked `units.run_id`
-- Worker exit codes: `0` applied, `1` lease lost, `2` idle / terminal no-op
+- Apply guards `leased_by`, `kind`, `ref_id`; attributes event/outbox from locked `units.run_id`
+- Outbox body on enqueue: `{effect, from_state, to_state, unit_id}` with `effect` ∈ `{stub_effect, stub_notify}`
 
 ## Deviations from `docs/ai_software_factory.md`
 
@@ -83,7 +98,7 @@ uv run mypy                        # files=["src"]; non-strict
 docker compose up -d
 uv run alembic upgrade head
 uv run python scripts/seed_dev.py  # truncates then seeds one cycle; --keep to append
-uv run python -m apps.worker       # exit 0 applied / 1 lease lost / 2 idle
+uv run python -m apps.worker       # exit 0 cycle / 1 apply error / 2 idle
 uv run python -m apps.outbox
 uv run pytest
 ```

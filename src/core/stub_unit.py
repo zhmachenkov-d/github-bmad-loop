@@ -1,19 +1,54 @@
-"""Stub Unit SM for story 1.1 only: stub_ready → stub_done. Story 1.2 replaces this."""
+"""Stub Unit SM (story 1.2): normative states, transition table, AD-16 keys."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 from uuid import UUID
 
 STUB_READY = "stub_ready"
+STUB_RUNNING = "stub_running"
+STUB_PAUSED = "stub_paused"
 STUB_DONE = "stub_done"
-STUB_EVENT_TYPE = "stub_unit_complete"
+STUB_FAILED = "stub_failed"
+
+STUB_START = "stub_start"
+STUB_COMPLETE = "stub_complete"
+STUB_PAUSE = "stub_pause"
+STUB_RESUME = "stub_resume"
+STUB_FAIL = "stub_fail"
+
+STUB_EFFECT = "stub_effect"
+STUB_NOTIFY = "stub_notify"
+
 STUB_OUTBOX_CHANNEL = "stub"
-STUB_OUTBOX_EFFECT = "stub_transition"
+
+STUB_UNIT_STATES: Final[frozenset[str]] = frozenset(
+    {
+        STUB_READY,
+        STUB_RUNNING,
+        STUB_PAUSED,
+        STUB_DONE,
+        STUB_FAILED,
+    }
+)
+STUB_TERMINAL_STATES: Final[frozenset[str]] = frozenset({STUB_DONE, STUB_FAILED})
 
 
 class LeaseLostError(Exception):
-    """Raised when apply cannot proceed because version or lease_id no longer match."""
+    """Lease, version, expiry, or unit row no longer matches apply guards."""
+
+
+class IllegalTransitionError(Exception):
+    """Valid lease but (from_state, event) is not a declared SM edge."""
+
+
+class InvalidUnitStateError(Exception):
+    """Unit state is outside the stub Unit SM enum."""
+
+
+class UnsupportedResultError(Exception):
+    """Apply `result` is not supported (story 1.2: only None)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,17 +62,42 @@ class UnitJobLease:
 
 
 @dataclass(frozen=True, slots=True)
-class StubTransition:
-    """Result of a successful stub_ready → stub_done apply (or a documented no-op)."""
+class TransitionDef:
+    to_state: str
+    effect: str | None
 
-    applied: bool
-    from_state: str | None
-    to_state: str | None
-    job_version_after: int | None
+
+@dataclass(frozen=True, slots=True)
+class ApplyTransitionResult:
+    from_state: str
+    to_state: str
+    job_version_after: int
     idempotency_key: str | None
 
 
-def outbox_idempotency_key(*, unit_id: UUID, transition_version: int) -> str:
+TRANSITIONS: Final[dict[tuple[str, str], TransitionDef]] = {
+    (STUB_READY, STUB_START): TransitionDef(STUB_RUNNING, None),
+    (STUB_RUNNING, STUB_COMPLETE): TransitionDef(STUB_DONE, STUB_EFFECT),
+    (STUB_RUNNING, STUB_PAUSE): TransitionDef(STUB_PAUSED, STUB_NOTIFY),
+    (STUB_PAUSED, STUB_RESUME): TransitionDef(STUB_RUNNING, None),
+    (STUB_RUNNING, STUB_FAIL): TransitionDef(STUB_FAILED, STUB_EFFECT),
+}
+
+
+def lookup_transition(*, from_state: str, event: str) -> TransitionDef:
+    if from_state in STUB_TERMINAL_STATES:
+        raise IllegalTransitionError(f"terminal state {from_state!r}")
+    edge = TRANSITIONS.get((from_state, event))
+    if edge is None:
+        raise IllegalTransitionError(f"unlisted ({from_state!r}, {event!r})")
+    if edge.to_state == from_state:
+        raise IllegalTransitionError("self-transition")
+    return edge
+
+
+def outbox_idempotency_key(
+    *, unit_id: UUID, effect: str, transition_version: int
+) -> str:
     """AD-16: aggregate_type:aggregate_id:effect_kind:dedupe_token."""
     dedupe_token = str(transition_version)
-    return f"unit:{unit_id}:{STUB_OUTBOX_EFFECT}:{dedupe_token}"
+    return f"unit:{unit_id}:{effect}:{dedupe_token}"
