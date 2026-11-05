@@ -1,0 +1,100 @@
+"""Compose-backed fixtures: require Postgres 18 reachable via DATABASE_URL."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from uuid import uuid4
+
+import psycopg
+import pytest
+from psycopg.rows import dict_row
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from adapters.postgres import database_url  # noqa: E402
+from core.stub_unit import STUB_READY  # noqa: E402
+
+DEFAULT_URL = "postgresql://bmad:bmad@127.0.0.1:5432/bmad"
+
+
+def _wait_for_db(url: str, attempts: int = 30) -> None:
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            with psycopg.connect(url, connect_timeout=2) as conn:
+                conn.execute("SELECT 1")
+            return
+        except Exception as exc:  # noqa: BLE001 — probe only
+            last = exc
+            import time
+
+            time.sleep(1)
+    raise RuntimeError(f"Postgres not reachable at {url}: {last}")
+
+
+@pytest.fixture(scope="session")
+def db_url() -> str:
+    url = os.environ.get("DATABASE_URL", DEFAULT_URL)
+    os.environ.setdefault("DATABASE_URL", url)
+    _wait_for_db(url)
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=ROOT,
+        check=True,
+        env={**os.environ, "DATABASE_URL": url},
+    )
+    return url
+
+
+@pytest.fixture
+def conn(db_url: str):
+    with psycopg.connect(db_url, row_factory=dict_row, autocommit=False) as connection:
+        with connection.transaction():
+            connection.execute(
+                """
+                TRUNCATE signals, outbox, event_log, jobs, units, runs
+                RESTART IDENTITY CASCADE
+                """
+            )
+        yield connection
+        connection.rollback()
+
+
+@pytest.fixture
+def seed_unit_job(conn):
+    def _seed(*, state: str = STUB_READY) -> dict:
+        run_id = uuid4()
+        unit_id = uuid4()
+        job_id = uuid4()
+        with conn.transaction():
+            conn.execute("INSERT INTO runs (id) VALUES (%s)", (run_id,))
+            conn.execute(
+                "INSERT INTO units (id, run_id, state) VALUES (%s, %s, %s)",
+                (unit_id, run_id, state),
+            )
+            conn.execute(
+                """
+                INSERT INTO jobs (id, kind, ref_id, version)
+                VALUES (%s, 'unit', %s, 0)
+                """,
+                (job_id, unit_id),
+            )
+        return {"run_id": run_id, "unit_id": unit_id, "job_id": job_id}
+
+    return _seed
+
+
+@pytest.fixture
+def counts(conn):
+    def _counts() -> dict[str, int]:
+        event_n = conn.execute("SELECT count(*) AS n FROM event_log").fetchone()["n"]
+        outbox_n = conn.execute("SELECT count(*) AS n FROM outbox").fetchone()["n"]
+        return {"event_log": event_n, "outbox": outbox_n}
+
+    return _counts
