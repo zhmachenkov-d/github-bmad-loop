@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from core.stub_unit import ApplyTransitionResult, UnitJobLease
+from ports.outbox_sender import OutboxMessage
 
 
 class JobStorePort(Protocol):
@@ -27,5 +28,20 @@ class JobStorePort(Protocol):
     ) -> ApplyTransitionResult:
         """AD-12 subset: one TX, lease/version guards, SM edge, event_log, outbox."""
 
-    def mark_outbox_sent(self, *, limit: int = 20) -> int:
-        """Stub dispatcher: pending → sent. Returns number of rows marked."""
+    def claim_due_outbox(self, *, limit: int = 20) -> list[OutboxMessage]:
+        """Claim due pending outbox rows (all channels). Caller holds the TX."""
+
+    def mark_outbox_success(self, msg_id: int, external_id: str) -> None:
+        """Mark row sent with external_id + sent_at."""
+
+    def mark_outbox_retry(
+        self,
+        msg_id: int,
+        *,
+        attempts: int,
+        delay_seconds: int,
+    ) -> None:
+        """Stay pending with bumped attempts and future next_attempt_at."""
+
+    def mark_outbox_dead(self, msg_id: int, *, attempts: int) -> None:
+        """Mark row dead (transient exhausted or permanent failure)."""

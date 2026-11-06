@@ -8,7 +8,8 @@ Hexagonal control plane (architecture spine Structural Seed):
 
 - `src/core/` — domain types and (later) Run/Unit SMs
 - `src/ports/` — protocols
-- `src/adapters/postgres/` — Postgres JobStore (lease, apply, outbox)
+- `src/adapters/postgres/` — Postgres JobStore (lease, apply, outbox claim/outcomes)
+- `src/adapters/outbox/` — ChannelRouter + stub `stub`/`github`/`slack` senders (no real API I/O)
 - `src/apps/worker/` — leased worker composition root
 - `src/apps/outbox/` — outbox dispatcher composition root
 - `alembic/` — schema migrations
@@ -58,7 +59,7 @@ Stub examples: `unit:{unit_id}:stub_effect:{job_version_at_apply}` or `…:stub_
 
 Inserts use `ON CONFLICT (idempotency_key) DO NOTHING`.
 
-The stub dispatcher marks **`channel = 'stub'`** `pending` → `sent` with **no** GitHub/Slack I/O. Non-stub pending rows are left untouched. This is **not** the production outbox (no retry, dead-letter, or real senders — story 1.4+).
+**Dispatcher (story 1.4):** continuous poll by default (idle sleep ≤2s); `--once` claims one due batch then exits. Claim: `status='pending' AND next_attempt_at <= now()`, all channels, `ORDER BY id`, `FOR UPDATE SKIP LOCKED`, `LIMIT` default 20. Route by `channel` to stub senders (`stub` / `github` / `slack`) — **no** real GitHub/Slack API I/O; unknown channels fail closed as permanent → `dead`. Success → `sent` + `external_id` + `sent_at`. `TransientError` → bump `attempts`; if new attempts `>= 10` (`OUTBOX_MAX_ATTEMPTS`) → `dead`, else stay `pending` with `next_attempt_at = now() + min(2^attempts, 300)` seconds. `PermanentError` → `dead` immediately. Never write `status='failed'`. Send-time idempotency: stub `github`/`slack` keep an in-memory key→`external_id` store (second `send` same key returns the same id, no second effect). Enqueue shape unchanged (AD-16). Stub senders are **not** production delivery.
 
 Integrity guards:
 
@@ -83,7 +84,7 @@ Do not copy the handoff `ai-factory/` tree verbatim.
 
 ## Local verify
 
-Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad` is local-dev). Override with `DATABASE_URL` outside that compose stack. Worker is a host-side continuous lease loop (`--once` for one-shot); outbox stays a host-side one-shot stub.
+Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad` is local-dev). Override with `DATABASE_URL` outside that compose stack. Worker and outbox are host-side continuous pollers (`--once` for one-shot seed / AGENT verify).
 
 Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/postgresql/data`). After pulling that compose change, reset the old volume once: `docker compose down -v` (destroys local DB data), then `docker compose up -d`.
 
@@ -102,8 +103,9 @@ uv run alembic upgrade head
 uv run python scripts/seed_dev.py  # truncates then seeds one cycle; --keep to append
 uv run python -m apps.worker --once  # exit 0 dispatched / 1 error / 2 idle
 uv run python -m apps.worker         # continuous poll until stopped
-uv run python -m apps.outbox
-uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, run no-op
+uv run python -m apps.outbox --once  # exit 0 processed / 2 idle; claim→send batch
+uv run python -m apps.outbox         # continuous poll until stopped
+uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, outbox retry/dead
 ```
 
 ### Local verify quality

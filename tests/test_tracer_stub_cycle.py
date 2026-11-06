@@ -12,7 +12,9 @@ import pytest
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from adapters.outbox.senders import StubSender
 from adapters.postgres import PostgresJobStore
+from apps.outbox.dispatcher import dispatch_batch
 from apps.worker import __main__ as worker_main
 from core.stub_unit import (
     STUB_COMPLETE,
@@ -86,11 +88,14 @@ def test_happy_path(conn, db_url, seed_unit_job, counts):
     }
 
     conn.commit()
-    marked = store.mark_outbox_sent()
-    assert marked == 1
+    assert dispatch_batch(store, StubSender().send) == 1
     with psycopg.connect(db_url, row_factory=dict_row) as other:
-        sent = other.execute("SELECT status FROM outbox").fetchone()
+        sent = other.execute(
+            "SELECT status, external_id, sent_at FROM outbox"
+        ).fetchone()
         assert sent["status"] == "sent"
+        assert sent["external_id"]
+        assert sent["sent_at"] is not None
     assert counts() == {"event_log": 2, "outbox": 1}
 
 
@@ -159,9 +164,9 @@ def test_terminal_apply_illegal_not_noop(conn, seed_unit_job, counts):
 def test_empty_queue(conn, counts):
     store = PostgresJobStore(conn)
     assert store.lease_next("worker-empty") is None
-    assert store.mark_outbox_sent() == 0
-    assert store.mark_outbox_sent(limit=0) == 0
-    assert store.mark_outbox_sent(limit=-1) == 0
+    assert dispatch_batch(store, StubSender().send) == 0
+    assert dispatch_batch(store, StubSender().send, limit=0) == 0
+    assert dispatch_batch(store, StubSender().send, limit=-1) == 0
     assert counts() == {"event_log": 0, "outbox": 0}
 
 
@@ -280,7 +285,11 @@ def test_outbox_on_conflict_dedupe(conn, seed_unit_job, counts):
     assert row["effect"] == "preseed"
 
 
-def test_mark_outbox_sent_stub_channel_only(conn, seed_unit_job, db_url):
+def test_dispatcher_claims_all_channels(conn, seed_unit_job, db_url):
+    """Claim is not stub-only; github/slack stub senders mark sent too."""
+    from adapters.outbox.router import ChannelRouter
+    from adapters.outbox.senders import GitHubStubSender
+
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
     lease = store.lease_next("w")
@@ -301,15 +310,15 @@ def test_mark_outbox_sent_stub_channel_only(conn, seed_unit_job, db_url):
             (ids["run_id"], ids["unit_id"], f"unit:{ids['unit_id']}:github:1"),
         )
     conn.commit()
-    marked = store.mark_outbox_sent()
-    assert marked == 1
+    router = ChannelRouter({"stub": StubSender(), "github": GitHubStubSender()})
+    assert dispatch_batch(store, router.send) == 2
     with psycopg.connect(db_url, row_factory=dict_row) as other:
         rows = {
             r["channel"]: r["status"]
             for r in other.execute("SELECT channel, status FROM outbox").fetchall()
         }
     assert rows["stub"] == "sent"
-    assert rows["github"] == "pending"
+    assert rows["github"] == "sent"
 
 
 def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
