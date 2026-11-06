@@ -14,6 +14,8 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.rows import dict_row
+
 from adapters.postgres import PostgresJobStore
 from apps.worker import __main__ as worker_main
 from apps.worker.loop import claim_and_dispatch, handle_unit, run_poll_loop
@@ -29,7 +31,6 @@ from core.stub_unit import (
     STUB_RUNNING,
     STUB_START,
 )
-from psycopg.rows import dict_row
 
 ROOT = Path(__file__).resolve().parents[1]
 
