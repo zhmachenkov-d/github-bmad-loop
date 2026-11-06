@@ -129,7 +129,10 @@ Host `uv run` / `--once` is **debug only**. Cutover, shared-host path, and Verif
 
 ```bash
 uv sync --frozen --extra dev
-uv run pre-commit install          # ruff-format only; rev must match uv.lock ruff
+# Shared bare pre-commit hook is installed by specs polyrepo ensure-child
+# (worktree-safe wrapper). Do not run stock `pre-commit install` here — it
+# hardcodes this worktree's .venv into the shared hook. Hook runs ruff-format
+# only; rev in .pre-commit-config.yaml must match uv.lock ruff.
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy                        # files=["src"]; non-strict
