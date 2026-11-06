@@ -110,15 +110,29 @@ def run_poll_loop(
     once: bool = False,
     idle_sleep: float = IDLE_SLEEP_SECONDS,
 ) -> int:
-    """Continuous poll until stopped; with ``once``, one claim+dispatch then exit."""
-    while True:
-        code = claim_and_dispatch(store, worker_id)
-        if once:
-            if code == 2:
-                print("no actionable job", file=sys.stderr)
-            return code
-        if code == 2:
-            time.sleep(idle_sleep)
-            continue
-        if code != 0:
-            return code
+    """Continuous poll until stopped; with ``once``, one claim+dispatch then exit.
+
+    Cooperative stop (KeyboardInterrupt) releases any in-flight lease before exit.
+    """
+    held: UnitJobLease | None = None
+    try:
+        while True:
+            lease = store.lease_next(worker_id)
+            if lease is None:
+                if once:
+                    print("no actionable job", file=sys.stderr)
+                    return 2
+                time.sleep(idle_sleep)
+                continue
+            held = lease
+            code = dispatch(store, lease, worker_id)
+            held = None
+            if once:
+                return code
+            if code != 0:
+                return code
+    except KeyboardInterrupt:
+        if held is not None:
+            store.release(held.job_id, held.lease_id)
+        print("worker stopped", file=sys.stderr)
+        return 0

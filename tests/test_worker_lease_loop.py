@@ -14,8 +14,6 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from psycopg.rows import dict_row
-
 from adapters.postgres import PostgresJobStore
 from apps.worker import __main__ as worker_main
 from apps.worker.loop import claim_and_dispatch, handle_unit, run_poll_loop
@@ -31,6 +29,7 @@ from core.stub_unit import (
     STUB_RUNNING,
     STUB_START,
 )
+from psycopg.rows import dict_row
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -135,6 +134,25 @@ def test_non_claimable_unit_states_skipped(conn, seed_unit_job, state):
     assert store.lease_next("w") is None
 
 
+def test_held_stub_running_blocks_second_claim(conn, seed_unit_job):
+    ids = seed_unit_job(state=STUB_RUNNING)
+    lease_id = uuid4()
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_id = %s,
+                leased_by = %s,
+                lease_expires_at = now() + interval '90 seconds',
+                version = 1
+            WHERE id = %s
+            """,
+            (lease_id, "holder", ids["job_id"]),
+        )
+    store = PostgresJobStore(conn)
+    assert store.lease_next("other") is None
+
+
 def test_mid_cycle_reclaim_complete_only(conn, seed_unit_job, counts):
     ids = seed_unit_job(state=STUB_RUNNING)
     lease_id = uuid4()
@@ -178,6 +196,52 @@ def test_mid_cycle_reclaim_complete_only(conn, seed_unit_job, counts):
     ).fetchone()
     assert unit["state"] == STUB_DONE
 
+    starts = conn.execute(
+        "SELECT count(*) AS n FROM event_log WHERE event_type = %s AND unit_id = %s",
+        (STUB_START, ids["unit_id"]),
+    ).fetchone()["n"]
+    completes = conn.execute(
+        "SELECT count(*) AS n FROM event_log WHERE event_type = %s AND unit_id = %s",
+        (STUB_COMPLETE, ids["unit_id"]),
+    ).fetchone()["n"]
+    effects = conn.execute(
+        "SELECT count(*) AS n FROM outbox WHERE payload->>'effect' = %s",
+        (STUB_EFFECT,),
+    ).fetchone()["n"]
+    assert starts == 1
+    assert completes == 1
+    assert effects == 1
+    assert counts() == {"event_log": 2, "outbox": 1}
+
+
+def test_null_lease_stub_running_reclaim_complete_only(conn, seed_unit_job, counts):
+    ids = seed_unit_job(state=STUB_RUNNING)
+    with conn.transaction():
+        conn.execute(
+            """
+            INSERT INTO event_log (
+                run_id, unit_id, from_state, to_state, event_type, worker_id, payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, '{}'::jsonb)
+            """,
+            (
+                ids["run_id"],
+                ids["unit_id"],
+                STUB_READY,
+                STUB_RUNNING,
+                STUB_START,
+                "dead-worker",
+            ),
+        )
+
+    store = PostgresJobStore(conn)
+    code = claim_and_dispatch(store, "reclaimer")
+    assert code == 0
+
+    unit = conn.execute(
+        "SELECT state FROM units WHERE id = %s", (ids["unit_id"],)
+    ).fetchone()
+    assert unit["state"] == STUB_DONE
     starts = conn.execute(
         "SELECT count(*) AS n FROM event_log WHERE event_type = %s AND unit_id = %s",
         (STUB_START, ids["unit_id"]),
@@ -313,9 +377,64 @@ def test_once_flag_exits_after_one_dispatch(conn, seed_fleet_unit_jobs, db_url):
     assert ready == 2
 
 
+def test_main_once_cli_exits_after_one_dispatch(
+    conn, seed_fleet_unit_jobs, db_url, monkeypatch
+):
+    seed_fleet_unit_jobs(3)
+    conn.commit()
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("WORKER_ID", "cli-once-w")
+    with pytest.raises(SystemExit) as exc:
+        worker_main.main(["--once"])
+    assert exc.value.code == 0
+    with psycopg.connect(db_url, row_factory=dict_row) as other:
+        done = other.execute(
+            "SELECT count(*) AS n FROM units WHERE state = %s", (STUB_DONE,)
+        ).fetchone()["n"]
+        ready = other.execute(
+            "SELECT count(*) AS n FROM units WHERE state = %s", (STUB_READY,)
+        ).fetchone()["n"]
+    assert done == 1
+    assert ready == 2
+
+
 def test_poll_loop_once_idle(conn):
     store = PostgresJobStore(conn)
     assert run_poll_loop(store, "w", once=True) == 2
+
+
+def test_poll_loop_stops_on_handler_error(conn, seed_unit_job, monkeypatch):
+    seed_unit_job()
+    store = PostgresJobStore(conn)
+    calls = {"n": 0}
+
+    def fail_once(store_arg, lease, worker_id):
+        calls["n"] += 1
+        return 1
+
+    monkeypatch.setattr("apps.worker.loop.dispatch", fail_once)
+    assert run_poll_loop(store, "w", once=False) == 1
+    assert calls["n"] == 1
+
+
+def test_poll_loop_releases_lease_on_keyboard_interrupt(
+    conn, seed_unit_job, monkeypatch
+):
+    ids = seed_unit_job()
+    store = PostgresJobStore(conn)
+
+    def boom(store_arg, lease, worker_id):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("apps.worker.loop.dispatch", boom)
+    assert run_poll_loop(store, "w", once=False) == 0
+    job = conn.execute(
+        "SELECT lease_id, leased_by, lease_expires_at FROM jobs WHERE id = %s",
+        (ids["job_id"],),
+    ).fetchone()
+    assert job["lease_id"] is None
+    assert job["leased_by"] is None
+    assert job["lease_expires_at"] is None
 
 
 def test_fleet_two_workers_100_units(db_url, seed_fleet_unit_jobs, conn):
@@ -341,6 +460,13 @@ def test_fleet_two_workers_100_units(db_url, seed_fleet_unit_jobs, conn):
     deadline = time.time() + 120
     try:
         while time.time() < deadline:
+            for i, p in enumerate(procs):
+                rc = p.poll()
+                if rc is not None:
+                    err = (p.stderr.read() if p.stderr else b"").decode()
+                    pytest.fail(
+                        f"fleet worker fleet-w{i} exited early rc={rc} stderr={err!r}"
+                    )
             with psycopg.connect(db_url, row_factory=dict_row) as c:
                 done = c.execute(
                     "SELECT count(*) AS n FROM units WHERE state = %s", (STUB_DONE,)
@@ -350,6 +476,8 @@ def test_fleet_two_workers_100_units(db_url, seed_fleet_unit_jobs, conn):
             time.sleep(0.2)
         else:
             pytest.fail("fleet did not reach 100 stub_done within timeout")
+        for i, p in enumerate(procs):
+            assert p.poll() is None, f"fleet-w{i} exited before drain complete"
     finally:
         for p in procs:
             p.terminate()

@@ -1,7 +1,8 @@
 """Worker composition root: continuous lease loop (default) or ``--once``.
 
 Exit codes for ``--once``: 0 applied/dispatched, 1 lease/SM/handler error, 2 idle.
-Continuous mode polls until stopped (SIGINT) or a non-idle handler error.
+Continuous mode polls until stopped (SIGINT releases any held lease) or a
+non-idle handler error.
 """
 
 from __future__ import annotations
@@ -42,11 +43,7 @@ def main(argv: list[str] | None = None) -> None:
 
     with connect() as conn:
         store = PostgresJobStore(conn)
-        try:
-            raise SystemExit(run_poll_loop(store, worker_id, once=False))
-        except KeyboardInterrupt:
-            print("worker stopped", file=sys.stderr)
-            raise SystemExit(0) from None
+        raise SystemExit(run_poll_loop(store, worker_id, once=False))
 
 
 if __name__ == "__main__":
