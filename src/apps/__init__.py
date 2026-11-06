@@ -1,1 +1,1 @@
-"""Composition roots: worker and outbox dispatcher (gateway deferred)."""
+"""Composition roots: worker, outbox dispatcher, and gateway health stub."""

@@ -2,20 +2,64 @@ services:
   postgres:
     image: postgres:18
     environment:
-      POSTGRES_USER: bmad
-      POSTGRES_PASSWORD: bmad
-      POSTGRES_DB: bmad
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
     ports:
-      # Local-only bind; default bmad/bmad credentials are for compose dev, not shared hosts.
+      # Local-only bind; credentials come from `.env` (never commit).
       - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bmad -d bmad"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 2s
       timeout: 5s
       retries: 15
     volumes:
       # PG 18+ images expect the mount at /var/lib/postgresql (versioned data dir inside).
       - pgdata:/var/lib/postgresql
+
+  migrate:
+    build: .
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set pre-encoded DATABASE_URL in .env (host postgres)}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set pre-encoded DATABASE_URL in .env (host postgres)}
+      WORKER_ID: ${WORKER_ID:?set WORKER_ID in .env}
+    command: ["python", "-m", "apps.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  outbox:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set pre-encoded DATABASE_URL in .env (host postgres)}
+    command: ["python", "-m", "apps.outbox"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set pre-encoded DATABASE_URL in .env (host postgres)}
+    command:
+      ["uvicorn", "apps.gateway.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

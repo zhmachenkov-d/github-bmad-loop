@@ -8,11 +8,14 @@ dependencies = [
     "psycopg[binary]>=3.3,<3.4",
     "sqlalchemy>=2.0,<3",
     "alembic>=1.20,<2",
+    "fastapi>=0.120,<1",
+    "uvicorn[standard]>=0.38,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "httpx>=0.28",
     "ruff>=0.14",
     "mypy>=1.18",
     "pre-commit>=4.0",
@@ -24,6 +27,7 @@ dev = [
 [project.scripts]
 bmad-worker = "apps.worker.__main__:main"
 bmad-outbox = "apps.outbox.__main__:main"
+bmad-gateway = "apps.gateway.__main__:main"
 
 [build-system]
 requires = ["setuptools>=75"]

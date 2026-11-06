@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from dotenv import load_dotenv
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -21,6 +22,8 @@ if str(SRC) not in sys.path:
 from core.stub_unit import JOB_KIND_RUN, JOB_KIND_UNIT, STUB_READY
 
 DEFAULT_URL = "postgresql://bmad:bmad@127.0.0.1:5432/bmad"
+
+load_dotenv(ROOT / ".env", override=False)
 
 
 def _wait_for_db(url: str, attempts: int = 30) -> None:
