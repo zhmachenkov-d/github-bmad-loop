@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.types.json import Jsonb
 
 from core.stub_unit import (
+    JOB_KIND_RUN,
+    JOB_KIND_UNIT,
+    STUB_DONE,
+    STUB_FAILED,
     STUB_OUTBOX_CHANNEL,
+    STUB_PAUSED,
     STUB_READY,
+    STUB_RUNNING,
     STUB_TERMINAL_STATES,
     STUB_UNIT_STATES,
     ApplyTransitionResult,
@@ -36,25 +42,49 @@ class PostgresJobStore:
         self._conn = conn
         self._lease_ttl = lease_ttl
 
-    def lease_next_unit_job(self, worker_id: str) -> UnitJobLease | None:
+    def lease_next(self, worker_id: str) -> UnitJobLease | None:
         with self._conn.transaction():
             row = self._conn.execute(
                 """
                 SELECT j.id AS job_id,
+                       j.kind AS kind,
+                       j.ref_id AS ref_id,
+                       j.version AS job_version,
                        u.run_id AS run_id,
                        u.id AS unit_id,
-                       j.version AS job_version,
                        u.state AS unit_state
                 FROM jobs j
-                JOIN units u ON u.id = j.ref_id
-                WHERE j.kind = 'unit'
-                  AND u.state = %s
-                  AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now())
+                LEFT JOIN units u ON j.kind = %s AND u.id = j.ref_id
+                WHERE (
+                    (
+                        j.kind = %s
+                        AND u.state IN (%s, %s)
+                        AND u.state NOT IN (%s, %s, %s)
+                        AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now())
+                    )
+                    OR (
+                        j.kind = %s
+                        AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now())
+                        -- Stub stand-in for Run SM: after successful release
+                        -- (lease cleared, version already bumped by claim) do not
+                        -- re-claim. Still reclaim crashed holds (lease_id set, expired).
+                        AND (j.version = 0 OR j.lease_id IS NOT NULL)
+                    )
+                )
                 ORDER BY j.created_at ASC
-                FOR UPDATE OF j, u SKIP LOCKED
+                FOR UPDATE OF j SKIP LOCKED
                 LIMIT 1
                 """,
-                (STUB_READY,),
+                (
+                    JOB_KIND_UNIT,
+                    JOB_KIND_UNIT,
+                    STUB_READY,
+                    STUB_RUNNING,
+                    STUB_PAUSED,
+                    STUB_DONE,
+                    STUB_FAILED,
+                    JOB_KIND_RUN,
+                ),
             ).fetchone()
             if row is None:
                 return None
@@ -74,14 +104,65 @@ class PostgresJobStore:
                 (lease_id, worker_id, self._lease_ttl, row["job_id"]),
             ).fetchone()
             assert updated is not None
+
+            kind = row["kind"]
+            if kind == JOB_KIND_UNIT:
+                assert row["unit_id"] is not None
+                assert row["run_id"] is not None
+                assert row["unit_state"] is not None
+                return UnitJobLease(
+                    job_id=row["job_id"],
+                    run_id=row["run_id"],
+                    unit_id=row["unit_id"],
+                    lease_id=lease_id,
+                    job_version=updated["version"],
+                    unit_state=row["unit_state"],
+                    kind=JOB_KIND_UNIT,
+                )
             return UnitJobLease(
                 job_id=row["job_id"],
-                run_id=row["run_id"],
-                unit_id=row["unit_id"],
+                run_id=row["ref_id"],
+                unit_id=row["ref_id"],
                 lease_id=lease_id,
                 job_version=updated["version"],
-                unit_state=row["unit_state"],
+                unit_state="",
+                kind=JOB_KIND_RUN,
             )
+
+    def heartbeat(self, job_id: UUID, lease_id: UUID, worker_id: str) -> bool:
+        with self._conn.transaction():
+            updated = self._conn.execute(
+                """
+                UPDATE jobs
+                SET lease_expires_at = now() + %s::interval,
+                    updated_at = now()
+                WHERE id = %s
+                  AND lease_id = %s
+                  AND leased_by = %s
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > now()
+                RETURNING id
+                """,
+                (self._lease_ttl, job_id, lease_id, worker_id),
+            ).fetchone()
+            return updated is not None
+
+    def release(self, job_id: UUID, lease_id: UUID) -> bool:
+        with self._conn.transaction():
+            updated = self._conn.execute(
+                """
+                UPDATE jobs
+                SET lease_id = NULL,
+                    leased_by = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE id = %s
+                  AND lease_id = %s
+                RETURNING id
+                """,
+                (job_id, lease_id),
+            ).fetchone()
+            return updated is not None
 
     def apply_transition(
         self,

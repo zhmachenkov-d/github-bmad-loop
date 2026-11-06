@@ -33,7 +33,7 @@ def test_happy_path(conn, db_url, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
 
-    lease = store.lease_next_unit_job("worker-a")
+    lease = store.lease_next("worker-a")
     assert lease is not None
     assert lease.unit_id == ids["unit_id"]
     assert lease.unit_state == STUB_READY
@@ -117,7 +117,7 @@ def test_worker_run_once_exit_one_on_apply_failure(conn, seed_unit_job, monkeypa
 def test_terminal_apply_illegal_not_noop(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("worker-a")
+    lease = store.lease_next("worker-a")
     assert lease is not None
     start = store.apply_transition(lease, "worker-a", STUB_START)
     lease = replace(
@@ -126,7 +126,7 @@ def test_terminal_apply_illegal_not_noop(conn, seed_unit_job, counts):
     store.apply_transition(lease, "worker-a", STUB_COMPLETE)
     before = counts()
 
-    assert store.lease_next_unit_job("worker-b") is None
+    assert store.lease_next("worker-b") is None
 
     forged_lease_id = uuid4()
     with conn.transaction():
@@ -158,7 +158,7 @@ def test_terminal_apply_illegal_not_noop(conn, seed_unit_job, counts):
 
 def test_empty_queue(conn, counts):
     store = PostgresJobStore(conn)
-    assert store.lease_next_unit_job("worker-empty") is None
+    assert store.lease_next("worker-empty") is None
     assert store.mark_outbox_sent() == 0
     assert store.mark_outbox_sent(limit=0) == 0
     assert store.mark_outbox_sent(limit=-1) == 0
@@ -168,15 +168,15 @@ def test_empty_queue(conn, counts):
 def test_held_lease_blocks_second_claim(conn, seed_unit_job):
     seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w1")
+    lease = store.lease_next("w1")
     assert lease is not None
-    assert store.lease_next_unit_job("w2") is None
+    assert store.lease_next("w2") is None
 
 
 def test_expired_lease_reclaim(conn, seed_unit_job):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    first = store.lease_next_unit_job("w1")
+    first = store.lease_next("w1")
     assert first is not None
     with conn.transaction():
         conn.execute(
@@ -187,7 +187,7 @@ def test_expired_lease_reclaim(conn, seed_unit_job):
             """,
             (ids["job_id"],),
         )
-    reclaimed = store.lease_next_unit_job("w2")
+    reclaimed = store.lease_next("w2")
     assert reclaimed is not None
     assert reclaimed.unit_id == ids["unit_id"]
     assert reclaimed.lease_id != first.lease_id
@@ -203,7 +203,7 @@ def test_expired_lease_reclaim(conn, seed_unit_job):
 def test_lease_mismatch_raises(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     bad = UnitJobLease(
         job_id=lease.job_id,
@@ -225,7 +225,7 @@ def test_lease_mismatch_raises(conn, seed_unit_job, counts):
 def test_run_id_mismatch_raises(conn, seed_unit_job, counts):
     seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     bad = UnitJobLease(
         job_id=lease.job_id,
@@ -243,7 +243,7 @@ def test_run_id_mismatch_raises(conn, seed_unit_job, counts):
 def test_outbox_on_conflict_dedupe(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     assert lease.job_version == 1
     start = store.apply_transition(lease, "w", STUB_START)
@@ -283,7 +283,7 @@ def test_outbox_on_conflict_dedupe(conn, seed_unit_job, counts):
 def test_mark_outbox_sent_stub_channel_only(conn, seed_unit_job, db_url):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     start = store.apply_transition(lease, "w", STUB_START)
     lease = replace(
@@ -325,7 +325,7 @@ def test_concurrent_claim(db_url, seed_unit_job, conn, counts):
             with psycopg.connect(db_url, row_factory=dict_row) as c:
                 store = PostgresJobStore(c)
                 barrier.wait(timeout=10)
-                lease = store.lease_next_unit_job(name)
+                lease = store.lease_next(name)
                 if lease is None:
                     results.append((name, None))
                     return

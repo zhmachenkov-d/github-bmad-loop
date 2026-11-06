@@ -1,6 +1,8 @@
 """Domain types and stub Unit SM (story 1.2)."""
 
 from core.stub_unit import (
+    JOB_KIND_RUN,
+    JOB_KIND_UNIT,
     STUB_COMPLETE,
     STUB_DONE,
     STUB_EFFECT,
@@ -29,6 +31,8 @@ from core.stub_unit import (
 )
 
 __all__ = [
+    "JOB_KIND_RUN",
+    "JOB_KIND_UNIT",
     "STUB_COMPLETE",
     "STUB_DONE",
     "STUB_EFFECT",
