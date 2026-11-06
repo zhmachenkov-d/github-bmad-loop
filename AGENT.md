@@ -146,7 +146,14 @@ uv run python -m apps.outbox --once  # exit 0 processed / 2 idle; claim→send b
 uv run python -m apps.outbox         # continuous poll until stopped
 uv run python -m apps.gateway        # health stub on :8080
 uv run pytest                        # uses DATABASE_URL from the environment / repo `.env` (loaded by conftest when present; does not override already-set env)
+# includes tests/test_control_plane_restart_failure.py (process kill + outbox/reconcile recovery)
 ```
+
+Worker env knobs (composition root / loop; production defaults unchanged when unset):
+
+- `LEASE_TTL_SECONDS` — optional float/int seconds passed into `PostgresJobStore` lease TTL (default 90s).
+- `BMAD_WORKER_HOLD_SECONDS` — optional hold sleep after `stub_start`+heartbeat before `stub_complete` (test/ops kill window; default `0` / off).
+
 
 Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml` on `pull_request` and `push`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks). Keep `.pre-commit-config.yaml` `rev` equal to the locked `ruff` version in `uv.lock`. Pre-commit stays **ruff format only** — Semgrep and mutmut are not hooks.
 
