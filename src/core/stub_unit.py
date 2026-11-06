@@ -50,8 +50,20 @@ class InvalidUnitStateError(Exception):
     """Unit state is outside the stub Unit SM enum."""
 
 
+STUCK_WHY_ATTEMPTS: Final[str] = "attempts"
+STUCK_WHY_DEADLINE: Final[str] = "deadline"
+ALLOWED_APPLY_RESULTS: Final[frozenset[str]] = frozenset(
+    {STUCK_WHY_ATTEMPTS, STUCK_WHY_DEADLINE}
+)
+
+STUCK_ALERT_EFFECT: Final[str] = "stuck_alert"
+DEAD_ALERT_EFFECT: Final[str] = "dead_alert"
+
+RECONCILE_ADVISORY_LOCK_KEY: Final[int] = 42
+
+
 class UnsupportedResultError(Exception):
-    """Apply `result` is not supported (story 1.2: only None)."""
+    """Apply `result` is outside the allowed why set (None or stuck why)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,3 +123,27 @@ def outbox_idempotency_key(
     """AD-16: aggregate_type:aggregate_id:effect_kind:dedupe_token."""
     dedupe_token = str(transition_version)
     return f"unit:{unit_id}:{effect}:{dedupe_token}"
+
+
+def stuck_alert_idempotency_key(*, unit_id: UUID, pre_steal_version: int) -> str:
+    """AD-16 stuck alert: unit:{unit_id}:stuck_alert:{pre_steal_version}."""
+    return f"unit:{unit_id}:{STUCK_ALERT_EFFECT}:{pre_steal_version}"
+
+
+def run_stuck_alert_idempotency_key(*, run_id: UUID, why: str) -> str:
+    """AD-16 run stuck alert: run:{run_id}:stuck_alert:{why} (stable across ticks)."""
+    return f"run:{run_id}:{STUCK_ALERT_EFFECT}:{why}"
+
+
+def dead_alert_idempotency_key(*, dead_outbox_id: int) -> str:
+    """AD-16 dead-outbox alert: outbox:{dead_id}:dead_alert:1."""
+    return f"outbox:{dead_outbox_id}:{DEAD_ALERT_EFFECT}:1"
+
+
+def stuck_why(*, attempts: int, max_attempts: int, deadline_passed: bool) -> str:
+    """Prefer attempts when both attempts and deadline are breached."""
+    if attempts >= max_attempts:
+        return STUCK_WHY_ATTEMPTS
+    if deadline_passed:
+        return STUCK_WHY_DEADLINE
+    raise ValueError("not stuck")

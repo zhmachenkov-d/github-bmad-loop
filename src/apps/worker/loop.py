@@ -6,6 +6,7 @@ import sys
 import time
 from dataclasses import replace
 
+from apps.worker.reconcile import RECONCILE_INTERVAL_SECONDS, run_reconcile_tick
 from core.stub_unit import (
     JOB_KIND_RUN,
     JOB_KIND_UNIT,
@@ -109,14 +110,26 @@ def run_poll_loop(
     *,
     once: bool = False,
     idle_sleep: float = IDLE_SLEEP_SECONDS,
+    reconcile_interval: float = RECONCILE_INTERVAL_SECONDS,
 ) -> int:
     """Continuous poll until stopped; with ``once``, one claim+dispatch then exit.
 
+    In continuous mode, a non-blocking reconcile tick runs about every
+    ``reconcile_interval`` seconds (try-lock miss is a no-op; never waits on lock).
     Cooperative stop (KeyboardInterrupt) releases any in-flight lease before exit.
     """
     held: UnitJobLease | None = None
+    last_reconcile = 0.0
     try:
         while True:
+            if not once:
+                now = time.monotonic()
+                if now - last_reconcile >= reconcile_interval:
+                    try:
+                        run_reconcile_tick(store, worker_id)
+                    except Exception as exc:  # noqa: BLE001 — isolate ops tick
+                        print(f"reconcile tick failed: {exc}", file=sys.stderr)
+                    last_reconcile = now
             lease = store.lease_next(worker_id)
             if lease is None:
                 if once:
