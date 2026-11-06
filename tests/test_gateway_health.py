@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 from apps.gateway import __main__ as gateway_main
 from apps.gateway.app import app, health
-from fastapi.testclient import TestClient
 
 
 def test_health_returns_200() -> None:
