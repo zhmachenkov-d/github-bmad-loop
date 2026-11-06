@@ -71,11 +71,11 @@ class PostgresJobStore:
                         j.kind = %s
                         AND u.state IN (%s, %s)
                         AND u.state NOT IN (%s, %s, %s)
-                        AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now())
+                        AND (j.lease_expires_at IS NULL OR j.lease_expires_at <= now())
                     )
                     OR (
                         j.kind = %s
-                        AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now())
+                        AND (j.lease_expires_at IS NULL OR j.lease_expires_at <= now())
                         -- Stub stand-in for Run SM: after successful release
                         -- (lease cleared, version already bumped by claim) do not
                         -- re-claim. Still reclaim crashed holds (lease_id set, expired).

@@ -14,7 +14,7 @@ Hexagonal control plane (architecture spine Structural Seed):
 - `src/apps/outbox/` — outbox dispatcher composition root
 - `src/apps/gateway/` — FastAPI health stub only (`GET /health`); no Slack/GitHub/panel/signal ingress
 - `alembic/` — schema migrations
-- `docker-compose.yml` — same topology locally and on the shared factory host: `postgres`, one-shot `migrate`, `worker`, `outbox`, `gateway`
+- `docker-compose.yml` — same topology locally and on the shared factory host: `postgres`, one-shot `migrate` (`alembic upgrade head` against the tracer DB), `worker`, `outbox`, `gateway` (see Stub Unit SM / Reconcile; Outbox below)
 
 ## Stub Unit SM (story 1.2)
 
@@ -44,7 +44,7 @@ Normative table and errors live in `src/core/stub_unit.py`. `jobs` is the lease/
 
 On success: bump `jobs.version` every apply; **retain** `lease_id` / `leased_by` / `lease_expires_at` on non-terminal targets; **clear** lease only on `stub_done` / `stub_failed`. Append `event_log` with `event_type` equal to the SM event string; JSONB `payload` keys `job_version` (pre-bump), `lease_id`, `effect`, `result`. Optional outbox row when the edge carries an effect.
 
-**Lease pool:** `JobStorePort.lease_next(worker_id)` claims one job from the shared `kind∈{run,unit}` pool (`FOR UPDATE SKIP LOCKED`, default TTL 90s, injectable). Unit claimable when `stub_ready` **or** `stub_running` with lease null/expired — never `stub_paused` / terminal. Run claimable when lease null/expired **and** (`version = 0` or `lease_id IS NOT NULL`) — stub stand-in so a released run is not re-claimed while expired mid-hold runs stay reclaimable. `heartbeat(job_id, lease_id, worker_id)` extends `lease_expires_at` by TTL on match (0 rows → handler stops, no further apply/release). `release(job_id, lease_id)` clears lease columns only when `lease_id` still matches.
+**Lease pool:** `JobStorePort.lease_next(worker_id)` claims one job from the shared `kind∈{run,unit}` pool (`FOR UPDATE SKIP LOCKED`, default TTL 90s, injectable). Expiry rule: valid lease ⇔ `lease_expires_at` non-null and `> now()`; expired ⇔ null or `<= now()` (`lease_next` / heartbeat / apply share this; reconcile grace stays `< now() - 5 minutes`). Unit claimable when `stub_ready` **or** `stub_running` with lease null/expired — never `stub_paused` / terminal. Run claimable when lease null/expired **and** (`version = 0` or `lease_id IS NOT NULL`) — stub stand-in so a released run is not re-claimed while expired mid-hold runs stay reclaimable. `heartbeat(job_id, lease_id, worker_id)` extends `lease_expires_at` by TTL on match (0 rows → handler stops, no further apply/release). `release(job_id, lease_id)` clears lease columns only when `lease_id` still matches.
 
 **Worker loop:** continuous poll by default (idle sleep ≤1s); `--once` does one claim+dispatch then exit. Dispatch by `kind`: unit `stub_ready` → `stub_start` then `stub_complete` (with `replace` version/state refresh + heartbeat between); reclaimed `stub_running` → heartbeat then `stub_complete` only (heartbeat loss → stop, no further apply/release); run → no-op `release` (no Unit SM / event_log / outbox). Stub run claim skips jobs already released after a successful claim (so the loop does not starve units); expired mid-hold run leases remain reclaimable until Run SM exists. Exit codes for `--once`: `0` dispatched, `1` apply/handler error, `2` idle. Continuous mode: non-idle handler `1` ends the process; SIGINT/`KeyboardInterrupt` releases any in-flight lease then exits `0`.
 
@@ -69,7 +69,8 @@ Integrity guards:
 - `units.state` CHECK ∈ stub enum (see table above)
 - `UNIQUE (jobs.kind, jobs.ref_id)` — one leaseable job row per unit/run ref
 - Apply guards `leased_by`, `kind`, `ref_id`; attributes event/outbox from locked `units.run_id`
-- Outbox body on enqueue: `{effect, from_state, to_state, unit_id}` with `effect` ∈ `{stub_effect, stub_notify}`
+- Outbox body on SM enqueue: `{effect, from_state, to_state, unit_id}` with `effect` ∈ `{stub_effect, stub_notify}`
+- Reconcile alert enqueue bodies: stuck `{effect: stuck_alert, why, kind, ref_id}`; dead `{effect: dead_alert, dead_outbox_id}` (channel `stub`, AD-16 keys under Reconcile tick)
 
 ## Deviations from `docs/ai_software_factory.md`
 
@@ -128,7 +129,7 @@ Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/post
 Host `uv run` / `--once` is **debug only**. Cutover, shared-host path, and Verify evidence use Compose services only.
 
 ```bash
-uv sync --frozen --extra dev
+uv sync --frozen --extra dev       # equiv: pip install -e ".[dev]"
 # Shared bare pre-commit hook is installed by specs polyrepo ensure-child
 # (worktree-safe wrapper). Do not run stock `pre-commit install` here — it
 # hardcodes this worktree's .venv into the shared hook. Hook runs ruff-format
@@ -152,6 +153,8 @@ Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with 
 Quality bar CI (AD-15 / R16) lives in `.github/workflows/quality-pr.yml` (PR/push Semgrep + diff mutmut) and `.github/workflows/quality-mutmut-schedule.yml` (Monday / `workflow_dispatch` full mutmut). Glue under `.ci/` is not package code. Owner Slack on worsen uses `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` via `chat.postMessage` (not a webhook); missing secrets skip notify without failing the job.
 
 ### Local verify quality
+
+Compose Postgres must be up and `DATABASE_URL` reachable (same prerequisite as everyday Local verify / `tests/conftest.py`) before mutmut — mutation runs invoke pytest against the DB.
 
 ```bash
 # Semgrep (AST-diff / baseline compare)
