@@ -1,1 +1,1 @@
-"""Stub outbox dispatcher: mark pending rows sent (no external I/O)."""
+"""Outbox dispatcher: claim→send with stub channel senders (retry/dead)."""

@@ -1,5 +1,6 @@
-"""Domain types and stub Unit SM (story 1.2)."""
+"""Domain types and stub Unit SM (story 1.2) + outbox policy (story 1.4)."""
 
+from core.outbox_policy import OUTBOX_MAX_ATTEMPTS, outbox_backoff_seconds
 from core.stub_unit import (
     JOB_KIND_RUN,
     JOB_KIND_UNIT,
@@ -33,6 +34,7 @@ from core.stub_unit import (
 __all__ = [
     "JOB_KIND_RUN",
     "JOB_KIND_UNIT",
+    "OUTBOX_MAX_ATTEMPTS",
     "STUB_COMPLETE",
     "STUB_DONE",
     "STUB_EFFECT",
@@ -57,5 +59,6 @@ __all__ = [
     "UnitJobLease",
     "UnsupportedResultError",
     "lookup_transition",
+    "outbox_backoff_seconds",
     "outbox_idempotency_key",
 ]

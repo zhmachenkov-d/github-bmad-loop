@@ -17,7 +17,7 @@ docker compose up -d
 uv run alembic upgrade head
 uv run python scripts/seed_dev.py
 uv run python -m apps.worker --once
-uv run python -m apps.outbox
+uv run python -m apps.outbox --once
 uv run pytest
 ```
 

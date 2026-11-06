@@ -1,4 +1,4 @@
-"""Postgres JobStore: lease + AD-12-subset apply + stub outbox mark-sent."""
+"""Postgres JobStore: lease + AD-12-subset apply + outbox claim/send outcomes."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from core.stub_unit import (
     lookup_transition,
     outbox_idempotency_key,
 )
+from ports.outbox_sender import OutboxMessage
 
 LEASE_TTL = timedelta(seconds=90)
 
@@ -41,6 +42,10 @@ class PostgresJobStore:
     ) -> None:
         self._conn = conn
         self._lease_ttl = lease_ttl
+
+    @property
+    def connection(self) -> psycopg.Connection[dict[str, Any]]:
+        return self._conn
 
     def lease_next(self, worker_id: str) -> UnitJobLease | None:
         with self._conn.transaction():
@@ -368,33 +373,72 @@ class PostgresJobStore:
             raise LeaseLostError("job version or lease mismatch")
         return int(job["version"])
 
-    def mark_outbox_sent(self, *, limit: int = 20) -> int:
+    def claim_due_outbox(self, *, limit: int = 20) -> list[OutboxMessage]:
+        """Claim due pending rows (all channels). Caller must hold an open TX."""
         if limit < 1:
-            return 0
-        with self._conn.transaction():
-            rows = self._conn.execute(
-                """
-                SELECT id
-                FROM outbox
-                WHERE status = 'pending'
-                  AND channel = %s
-                  AND next_attempt_at <= now()
-                ORDER BY id
-                FOR UPDATE SKIP LOCKED
-                LIMIT %s
-                """,
-                (STUB_OUTBOX_CHANNEL, limit),
-            ).fetchall()
-            if not rows:
-                return 0
-            ids = [r["id"] for r in rows]
-            self._conn.execute(
-                """
-                UPDATE outbox
-                SET status = 'sent',
-                    sent_at = now()
-                WHERE id = ANY(%s)
-                """,
-                (ids,),
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT id, run_id, unit_id, channel, idempotency_key, payload, attempts
+            FROM outbox
+            WHERE status = 'pending'
+              AND next_attempt_at <= now()
+            ORDER BY id
+            FOR UPDATE SKIP LOCKED
+            LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            OutboxMessage(
+                id=int(r["id"]),
+                run_id=r["run_id"],
+                unit_id=r["unit_id"],
+                channel=r["channel"],
+                idempotency_key=r["idempotency_key"],
+                payload=dict(r["payload"]),
+                attempts=int(r["attempts"]),
             )
-            return len(ids)
+            for r in rows
+        ]
+
+    def mark_outbox_success(self, msg_id: int, external_id: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE outbox
+            SET status = 'sent',
+                external_id = %s,
+                sent_at = now()
+            WHERE id = %s
+            """,
+            (external_id, msg_id),
+        )
+
+    def mark_outbox_retry(
+        self,
+        msg_id: int,
+        *,
+        attempts: int,
+        delay_seconds: int,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE outbox
+            SET status = 'pending',
+                attempts = %s,
+                next_attempt_at = now() + (%s * interval '1 second')
+            WHERE id = %s
+            """,
+            (attempts, delay_seconds, msg_id),
+        )
+
+    def mark_outbox_dead(self, msg_id: int, *, attempts: int) -> None:
+        self._conn.execute(
+            """
+            UPDATE outbox
+            SET status = 'dead',
+                attempts = %s
+            WHERE id = %s
+            """,
+            (attempts, msg_id),
+        )
