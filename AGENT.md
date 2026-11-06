@@ -10,10 +10,11 @@ Hexagonal control plane (architecture spine Structural Seed):
 - `src/ports/` — protocols
 - `src/adapters/postgres/` — Postgres JobStore (lease, apply, outbox claim/outcomes)
 - `src/adapters/outbox/` — ChannelRouter + stub `stub`/`github`/`slack` senders (no real API I/O)
-- `src/apps/worker/` — leased worker composition root
+- `src/apps/worker/` — leased worker composition root (continuous lease + in-process reconcile)
 - `src/apps/outbox/` — outbox dispatcher composition root
+- `src/apps/gateway/` — FastAPI health stub only (`GET /health`); no Slack/GitHub/panel/signal ingress
 - `alembic/` — schema migrations
-- `docker-compose.yml` — PostgreSQL 18 for local `dev`
+- `docker-compose.yml` — same topology locally and on the shared factory host: `postgres`, one-shot `migrate`, `worker`, `outbox`, `gateway`
 
 ## Stub Unit SM (story 1.2)
 
@@ -84,15 +85,43 @@ Handoff contracts for lease / atomic transition / outbox bind, with these mappin
 
 Do not copy the handoff `ai-factory/` tree verbatim.
 
+## Secrets / env bootstrap
+
+Required env **names** (values never committed; see `.env.example`):
+
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_DB`
+- `DATABASE_URL` — host-side debug only (`127.0.0.1`); Compose app services build the URL with host `postgres` from `POSTGRES_*`
+- `WORKER_ID`
+
+Copy `.env.example` → `.env`, fill values, never commit `.env`. Laptop defaults such as `bmad`/`bmad` are local-dev only — **not** shared-host / prod posture.
+
 ## Local verify
 
-Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad` is local-dev). Override with `DATABASE_URL` outside that compose stack. Worker and outbox are host-side continuous pollers (`--once` for one-shot seed / AGENT verify).
+Documented bring-up is Compose-first (AD-7): one topology for local and shared host.
 
-Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/postgresql/data`). After pulling that compose change, reset the old volume once: `docker compose down -v` (destroys local DB data), then `docker compose up -d`.
+```bash
+cp .env.example .env   # fill POSTGRES_* / WORKER_ID / DATABASE_URL (host debug)
+docker compose up -d --build
+docker compose ps      # migrate exited 0; postgres/worker/outbox/gateway running
+curl -sf http://127.0.0.1:8080/health
+docker compose run --rm worker python scripts/seed_dev.py
+# wait for continuous worker+outbox, then:
+docker compose exec postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"
+docker compose exec postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"
+# expect unit state stub_done and outbox status sent
+```
 
-Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml` on `pull_request` and `push`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks). Keep `.pre-commit-config.yaml` `rev` equal to the locked `ruff` version in `uv.lock`. Pre-commit stays **ruff format only** — Semgrep and mutmut are not hooks.
+Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/postgresql/data`). After pulling that compose change, reset the old volume once: `docker compose down -v` (destroys local DB data), then `docker compose up -d --build`.
 
-Quality bar CI (AD-15 / R16) lives in `.github/workflows/quality-pr.yml` (PR/push Semgrep + diff mutmut) and `.github/workflows/quality-mutmut-schedule.yml` (Monday / `workflow_dispatch` full mutmut). Glue under `.ci/` is not package code. Owner Slack on worsen uses `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` via `chat.postMessage` (not a webhook); missing secrets skip notify without failing the job.
+### Host-side debug only
+
+Host `uv run` / `--once` is **debug only**. Cutover, shared-host path, and Verify evidence use Compose services only.
 
 ```bash
 uv sync --frozen --extra dev
@@ -100,16 +129,68 @@ uv run pre-commit install          # ruff-format only; rev must match uv.lock ru
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy                        # files=["src"]; non-strict
-docker compose up -d
-uv run alembic upgrade head
-uv run python scripts/seed_dev.py  # truncates then seeds one cycle; --keep to append
+uv run alembic upgrade head        # only when debugging against host Postgres
+uv run python scripts/seed_dev.py
 uv run python -m apps.worker --once  # exit 0 dispatched / 1 error / 2 idle
 uv run python -m apps.worker --reconcile-once  # one reconcile tick; 0 locked / 2 lock miss
 uv run python -m apps.worker         # continuous poll + 60s reconcile until stopped
 uv run python -m apps.outbox --once  # exit 0 processed / 2 idle; claim→send batch
 uv run python -m apps.outbox         # continuous poll until stopped
-uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, outbox, reconcile
+uv run python -m apps.gateway        # health stub on :8080
+uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, outbox, reconcile, gateway /health
 ```
+
+Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml` on `pull_request` and `push`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks). Keep `.pre-commit-config.yaml` `rev` equal to the locked `ruff` version in `uv.lock`. Pre-commit stays **ruff format only** — Semgrep and mutmut are not hooks.
+
+Quality bar CI (AD-15 / R16) lives in `.github/workflows/quality-pr.yml` (PR/push Semgrep + diff mutmut) and `.github/workflows/quality-mutmut-schedule.yml` (Monday / `workflow_dispatch` full mutmut). Glue under `.ci/` is not package code. Owner Slack on worsen uses `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` via `chat.postMessage` (not a webhook); missing secrets skip notify without failing the job.
+
+## Deploy (shared factory host)
+
+Persistent founding-team Linux host (not laptop, not throwaway Codespace-as-factory). Same Compose topology — no profiles.
+
+1. Clone or pull this repo on the host.
+2. `cp .env.example .env` and fill non-laptop credentials (`POSTGRES_*`, `WORKER_ID`; do not reuse default laptop `bmad`/`bmad` as shared-host posture). `DATABASE_URL` is optional on the host when using only Compose services (apps get URL via Compose DNS `postgres`).
+3. Bring-up (migrate completes before apps start):
+
+```bash
+docker compose up -d --build
+docker compose ps
+# migrate: exited (0); postgres / worker / outbox / gateway: running
+docker compose logs migrate   # alembic upgrade head
+curl -sf http://127.0.0.1:8080/health
+```
+
+4. Seed one stub cycle (Compose path — preferred for Verify evidence):
+
+```bash
+docker compose run --rm worker python scripts/seed_dev.py
+# continuous worker/outbox Compose services process the cycle
+```
+
+Confirm with runbook queries (not a full log dump):
+
+```bash
+docker compose exec postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"
+docker compose exec postgres \
+  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"
+```
+
+Expect `stub_done` and `sent`.
+
+### HITL cutover checklist (fill on shared host — no secrets)
+
+Implementer ships empty slots. A person fills these on the founding-team shared host before this story is done. Do **not** record passwords, keys, or tokens here. Optional evidence may live in a private PR/issue instead.
+
+1. Hostname + non-secret access path:
+   - _(empty)_
+2. Migrate / alembic head result:
+   - _(empty)_
+3. Seeded cycle: unit `stub_done` + outbox `sent` (runbook commands above):
+   - _(empty)_
+
 
 ### Local verify quality
 
