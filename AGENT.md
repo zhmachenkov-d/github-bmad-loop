@@ -129,7 +129,7 @@ Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/post
 Host `uv run` / `--once` is **debug only**. Cutover, shared-host path, and Verify evidence use Compose services only.
 
 ```bash
-uv sync --frozen --extra dev       # # equiv: pip install -e ".[dev]"
+uv sync --frozen --extra dev       # equiv: pip install -e ".[dev]"
 # Shared bare pre-commit hook is installed by specs polyrepo ensure-child
 # (worktree-safe wrapper). Do not run stock `pre-commit install` here — it
 # hardcodes this worktree's .venv into the shared hook. Hook runs ruff-format
