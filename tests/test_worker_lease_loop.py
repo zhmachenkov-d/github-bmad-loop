@@ -399,9 +399,65 @@ def test_main_once_cli_exits_after_one_dispatch(
     assert ready == 2
 
 
+def test_run_once_uses_worker_id_from_env(conn, seed_unit_job, db_url, monkeypatch):
+    """Kill run_once env/or mutants: no arg → WORKER_ID from env reaches lease_next."""
+    seed_unit_job()
+    conn.commit()
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("WORKER_ID", "from-env-w")
+    seen: dict[str, str] = {}
+    real_lease_next = PostgresJobStore.lease_next
+
+    def wrap(self, worker_id: str):
+        seen["worker_id"] = worker_id
+        return real_lease_next(self, worker_id)
+
+    monkeypatch.setattr(PostgresJobStore, "lease_next", wrap)
+    assert worker_main.run_once() == 0
+    assert seen["worker_id"] == "from-env-w"
+
+
+def test_main_continuous_default_worker_and_once_false(db_url, monkeypatch):
+    """Kill main() continuous mutants: default worker-1 and explicit once=False."""
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.delenv("WORKER_ID", raising=False)
+    captured: dict[str, object] = {}
+
+    # Default once=True so omitting once=False from main() fails the assertion.
+    def fake_poll(store, worker_id, *, once: bool = True, idle_sleep: float = 0.5):
+        del store, idle_sleep
+        captured["worker_id"] = worker_id
+        captured["once"] = once
+        return 7
+
+    monkeypatch.setattr(worker_main, "run_poll_loop", fake_poll)
+    with pytest.raises(SystemExit) as exc:
+        worker_main.main([])
+    assert exc.value.code == 7
+    assert captured == {"worker_id": "worker-1", "once": False}
+
+
 def test_poll_loop_once_idle(conn):
     store = PostgresJobStore(conn)
     assert run_poll_loop(store, "w", once=True) == 2
+
+
+def test_poll_loop_default_continues_after_success(
+    conn, seed_fleet_unit_jobs, monkeypatch
+):
+    """Kill once-default / stop-on-success / idle-break mutants (no once= kwarg)."""
+    seed_fleet_unit_jobs(2)
+    store = PostgresJobStore(conn)
+
+    def stop_on_idle(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("apps.worker.loop.time.sleep", stop_on_idle)
+    assert run_poll_loop(store, "w") == 0
+    done = conn.execute(
+        "SELECT count(*) AS n FROM units WHERE state = %s", (STUB_DONE,)
+    ).fetchone()["n"]
+    assert done == 2
 
 
 def test_poll_loop_stops_on_handler_error(conn, seed_unit_job, monkeypatch):
