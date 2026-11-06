@@ -380,6 +380,37 @@ def test_grace_skips_stuck_eligible_very_stale_lease(conn, seed_unit_job):
     assert event["payload"]["result"] == STUCK_WHY_ATTEMPTS
 
 
+def test_grace_clears_paused_with_breach_and_very_stale_lease(conn, seed_unit_job):
+    """Non-running non-terminal work still gets grace; stuck only handles running."""
+    ids = seed_unit_job(
+        state=STUB_PAUSED,
+        attempts=3,
+        max_attempts=3,
+        lease_expires_age="6 minutes",
+        version=2,
+    )
+    store = PostgresJobStore(conn)
+    result = run_reconcile_tick(store, "reconcile-w")
+    assert result.locked is True
+    assert result.grace_cleared == 1
+    assert result.units_failed == 0
+    job = conn.execute(
+        """
+        SELECT lease_id, leased_by, lease_expires_at, version
+        FROM jobs WHERE id = %s
+        """,
+        (ids["job_id"],),
+    ).fetchone()
+    assert job["lease_id"] is None
+    assert job["leased_by"] is None
+    assert job["lease_expires_at"] is None
+    assert job["version"] == 3
+    unit = conn.execute(
+        "SELECT state FROM units WHERE id = %s", (ids["unit_id"],)
+    ).fetchone()
+    assert unit["state"] == STUB_PAUSED
+
+
 def test_reconcile_exception_keeps_poll_loop_alive(
     conn, seed_unit_job, monkeypatch, capsys
 ):

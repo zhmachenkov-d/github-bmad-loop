@@ -358,12 +358,18 @@ class PostgresJobStore:
                   AND j.lease_expires_at < now() - interval '5 minutes'
                   AND u.state NOT IN (%s, %s)
                   AND NOT (
-                      j.attempts >= j.max_attempts
-                      OR (j.deadline_at IS NOT NULL AND j.deadline_at < now())
+                      u.state = %s
+                      AND (
+                          j.attempts >= j.max_attempts
+                          OR (
+                              j.deadline_at IS NOT NULL
+                              AND j.deadline_at < now()
+                          )
+                      )
                   )
                 RETURNING j.id
                 """,
-                (JOB_KIND_UNIT, STUB_DONE, STUB_FAILED),
+                (JOB_KIND_UNIT, STUB_DONE, STUB_FAILED, STUB_RUNNING),
             ).fetchall()
             run_cleared = self._conn.execute(
                 """
