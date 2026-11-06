@@ -11,6 +11,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -67,43 +68,145 @@ def conn(db_url: str):
 
 @pytest.fixture
 def seed_unit_job(conn):
-    def _seed(*, state: str = STUB_READY) -> dict:
+    def _seed(
+        *,
+        state: str = STUB_READY,
+        attempts: int = 0,
+        max_attempts: int = 3,
+        deadline_at=None,
+        lease_expires_age: str | None = None,
+        leased_by: str = "w",
+        version: int = 0,
+    ) -> dict:
         run_id = uuid4()
         unit_id = uuid4()
         job_id = uuid4()
+        lease_id = uuid4() if lease_expires_age is not None else None
         with conn.transaction():
             conn.execute("INSERT INTO runs (id) VALUES (%s)", (run_id,))
             conn.execute(
                 "INSERT INTO units (id, run_id, state) VALUES (%s, %s, %s)",
                 (unit_id, run_id, state),
             )
-            conn.execute(
-                """
-                INSERT INTO jobs (id, kind, ref_id, version)
-                VALUES (%s, %s, %s, 0)
-                """,
-                (job_id, JOB_KIND_UNIT, unit_id),
-            )
-        return {"run_id": run_id, "unit_id": unit_id, "job_id": job_id}
+            if lease_expires_age is not None:
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, kind, ref_id, version,
+                        attempts, max_attempts, deadline_at,
+                        lease_id, leased_by, lease_expires_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, now() - (%s::interval)
+                    )
+                    """,
+                    (
+                        job_id,
+                        JOB_KIND_UNIT,
+                        unit_id,
+                        version,
+                        attempts,
+                        max_attempts,
+                        deadline_at,
+                        lease_id,
+                        leased_by,
+                        lease_expires_age,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, kind, ref_id, version,
+                        attempts, max_attempts, deadline_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id,
+                        JOB_KIND_UNIT,
+                        unit_id,
+                        version,
+                        attempts,
+                        max_attempts,
+                        deadline_at,
+                    ),
+                )
+        return {
+            "run_id": run_id,
+            "unit_id": unit_id,
+            "job_id": job_id,
+            "lease_id": lease_id,
+        }
 
     return _seed
 
 
 @pytest.fixture
 def seed_run_job(conn):
-    def _seed() -> dict:
+    def _seed(
+        *,
+        attempts: int = 0,
+        max_attempts: int = 3,
+        deadline_at=None,
+        lease_expires_age: str | None = None,
+        leased_by: str = "w",
+        version: int = 0,
+    ) -> dict:
         run_id = uuid4()
         job_id = uuid4()
+        lease_id = uuid4() if lease_expires_age is not None else None
         with conn.transaction():
             conn.execute("INSERT INTO runs (id) VALUES (%s)", (run_id,))
-            conn.execute(
-                """
-                INSERT INTO jobs (id, kind, ref_id, version)
-                VALUES (%s, %s, %s, 0)
-                """,
-                (job_id, JOB_KIND_RUN, run_id),
-            )
-        return {"run_id": run_id, "job_id": job_id}
+            if lease_expires_age is not None:
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, kind, ref_id, version,
+                        attempts, max_attempts, deadline_at,
+                        lease_id, leased_by, lease_expires_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, now() - (%s::interval)
+                    )
+                    """,
+                    (
+                        job_id,
+                        JOB_KIND_RUN,
+                        run_id,
+                        version,
+                        attempts,
+                        max_attempts,
+                        deadline_at,
+                        lease_id,
+                        leased_by,
+                        lease_expires_age,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        id, kind, ref_id, version,
+                        attempts, max_attempts, deadline_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id,
+                        JOB_KIND_RUN,
+                        run_id,
+                        version,
+                        attempts,
+                        max_attempts,
+                        deadline_at,
+                    ),
+                )
+        return {"run_id": run_id, "job_id": job_id, "lease_id": lease_id}
 
     return _seed
 
@@ -143,3 +246,29 @@ def counts(conn):
         return {"event_log": event_n, "outbox": outbox_n}
 
     return _counts
+
+
+@pytest.fixture
+def seed_dead_outbox(conn, seed_unit_job):
+    def _seed(*, channel: str = "stub") -> dict:
+        ids = seed_unit_job()
+        with conn.transaction():
+            row = conn.execute(
+                """
+                INSERT INTO outbox (
+                    run_id, unit_id, channel, idempotency_key, payload, status, attempts
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, 'dead', 10)
+                RETURNING id
+                """,
+                (
+                    ids["run_id"],
+                    ids["unit_id"],
+                    channel,
+                    f"unit:{ids['unit_id']}:stub_effect:dead-seed",
+                    Jsonb({"effect": "stub_effect", "seed": "dead"}),
+                ),
+            ).fetchone()
+        return {**ids, "dead_outbox_id": row["id"]}
+
+    return _seed

@@ -276,7 +276,44 @@ def test_leased_by_mismatch_before_illegal_transition(conn, seed_unit_job, count
     assert counts() == {"event_log": 0, "outbox": 0}
 
 
-def test_unsupported_result(conn, seed_unit_job, counts):
+def test_allowed_why_result_written_to_event_log(conn, seed_unit_job, counts):
+    """Stuck why values pass through into event_log.payload.result."""
+    ids = seed_unit_job(state=STUB_RUNNING)
+    lease_id = uuid4()
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_id = %s,
+                leased_by = %s,
+                lease_expires_at = now() + interval '90 seconds',
+                version = version + 1
+            WHERE id = %s
+            """,
+            (lease_id, "w", ids["job_id"]),
+        )
+    job = conn.execute(
+        "SELECT version, lease_id FROM jobs WHERE id = %s", (ids["job_id"],)
+    ).fetchone()
+    lease = UnitJobLease(
+        job_id=ids["job_id"],
+        run_id=ids["run_id"],
+        unit_id=ids["unit_id"],
+        lease_id=job["lease_id"],
+        job_version=job["version"],
+        unit_state=STUB_RUNNING,
+    )
+    store = PostgresJobStore(conn)
+    result = store.apply_transition(lease, "w", STUB_FAIL, result="attempts")
+    assert result.to_state == STUB_FAILED
+    event = conn.execute(
+        "SELECT payload FROM event_log WHERE unit_id = %s", (ids["unit_id"],)
+    ).fetchone()
+    assert event["payload"]["result"] == "attempts"
+    assert counts()["event_log"] == 1
+
+
+def test_unsupported_result_shape(conn, seed_unit_job, counts):
     seed_unit_job()
     store = PostgresJobStore(conn)
     lease = store.lease_next("w")

@@ -39,13 +39,15 @@ Declared edges (anything else → `IllegalTransitionError`):
 
 Normative table and errors live in `src/core/stub_unit.py`. `jobs` is the lease/work queue only (`kind` ∈ `{run,unit}`, `ref_id`, lease columns, `version`); it does **not** store SM state.
 
-**Apply (AD-12 subset):** `JobStorePort.apply_transition(lease, worker_id, event, result=None)` → `ApplyTransitionResult` with `job_version_after`. One transaction on the store-held connection: lease/version/`lease_expires_at > now()`/`leased_by` guards → enum state → table lookup. Guard order: `LeaseLostError` → `InvalidUnitStateError` → `IllegalTransitionError`. Non-`None` `result` → `UnsupportedResultError` before any write (story 1.2: always omit `result`).
+**Apply (AD-12 subset):** `JobStorePort.apply_transition(lease, worker_id, event, result=None)` → `ApplyTransitionResult` with `job_version_after`. One transaction on the store-held connection: lease/version/`lease_expires_at > now()`/`leased_by` guards → enum state → table lookup. Guard order: `LeaseLostError` → `InvalidUnitStateError` → `IllegalTransitionError`. Allowed `result`: `None` or stuck why `"attempts"` / `"deadline"` (written into `event_log.payload.result`); any other shape → `UnsupportedResultError` before any write.
 
-On success: bump `jobs.version` every apply; **retain** `lease_id` / `leased_by` / `lease_expires_at` on non-terminal targets; **clear** lease only on `stub_done` / `stub_failed`. Append `event_log` with `event_type` equal to the SM event string; JSONB `payload` keys `job_version` (pre-bump), `lease_id`, `effect`, `result` (always `null`). Optional outbox row when the edge carries an effect.
+On success: bump `jobs.version` every apply; **retain** `lease_id` / `leased_by` / `lease_expires_at` on non-terminal targets; **clear** lease only on `stub_done` / `stub_failed`. Append `event_log` with `event_type` equal to the SM event string; JSONB `payload` keys `job_version` (pre-bump), `lease_id`, `effect`, `result`. Optional outbox row when the edge carries an effect.
 
 **Lease pool:** `JobStorePort.lease_next(worker_id)` claims one job from the shared `kind∈{run,unit}` pool (`FOR UPDATE SKIP LOCKED`, default TTL 90s, injectable). Unit claimable when `stub_ready` **or** `stub_running` with lease null/expired — never `stub_paused` / terminal. Run claimable when lease null/expired **and** (`version = 0` or `lease_id IS NOT NULL`) — stub stand-in so a released run is not re-claimed while expired mid-hold runs stay reclaimable. `heartbeat(job_id, lease_id, worker_id)` extends `lease_expires_at` by TTL on match (0 rows → handler stops, no further apply/release). `release(job_id, lease_id)` clears lease columns only when `lease_id` still matches.
 
 **Worker loop:** continuous poll by default (idle sleep ≤1s); `--once` does one claim+dispatch then exit. Dispatch by `kind`: unit `stub_ready` → `stub_start` then `stub_complete` (with `replace` version/state refresh + heartbeat between); reclaimed `stub_running` → heartbeat then `stub_complete` only (heartbeat loss → stop, no further apply/release); run → no-op `release` (no Unit SM / event_log / outbox). Stub run claim skips jobs already released after a successful claim (so the loop does not starve units); expired mid-hold run leases remain reclaimable until Run SM exists. Exit codes for `--once`: `0` dispatched, `1` apply/handler error, `2` idle. Continuous mode: non-idle handler `1` ends the process; SIGINT/`KeyboardInterrupt` releases any in-flight lease then exits `0`.
+
+**Reconcile tick (story 1.5):** in-process on the worker (default every 60s in continuous mode; `--reconcile-once` for one-shot). Under `pg_try_advisory_lock(42)` (miss → no-op; never blocks the lease loop): (1) grace force-clear leases with `lease_expires_at < now() - 5 minutes` on non-terminal unit work / held run leases (bump `jobs.version`, no `units.state` change); (2) `stub_running` past `attempts`/`deadline_at` → steal short reconcile lease → `apply_transition(stub_fail, result=why)` + stuck-alert outbox (`unit:{id}:stuck_alert:{pre_steal_version}`); run-kind breach → clear held lease + stuck alert (no Unit SM); (3) `status='dead'` outbox → one stub dead-alert (`outbox:{id}:dead_alert:1`). `jobs.attempts` / `max_attempts` / `deadline_at` are fixture/seed columns only (no runtime attempts writer this story).
 
 ## Outbox (AD-16)
 
@@ -102,10 +104,11 @@ docker compose up -d
 uv run alembic upgrade head
 uv run python scripts/seed_dev.py  # truncates then seeds one cycle; --keep to append
 uv run python -m apps.worker --once  # exit 0 dispatched / 1 error / 2 idle
-uv run python -m apps.worker         # continuous poll until stopped
+uv run python -m apps.worker --reconcile-once  # one reconcile tick; 0 locked / 2 lock miss
+uv run python -m apps.worker         # continuous poll + 60s reconcile until stopped
 uv run python -m apps.outbox --once  # exit 0 processed / 2 idle; claim→send batch
 uv run python -m apps.outbox         # continuous poll until stopped
-uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, outbox retry/dead
+uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, outbox, reconcile
 ```
 
 ### Local verify quality

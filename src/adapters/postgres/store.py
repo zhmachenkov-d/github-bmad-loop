@@ -1,4 +1,4 @@
-"""Postgres JobStore: lease + AD-12-subset apply + outbox claim/send outcomes."""
+"""Postgres JobStore: lease + AD-12-subset apply + outbox claim/send + reconcile."""
 
 from __future__ import annotations
 
@@ -10,8 +10,11 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from core.stub_unit import (
+    ALLOWED_APPLY_RESULTS,
+    DEAD_ALERT_EFFECT,
     JOB_KIND_RUN,
     JOB_KIND_UNIT,
+    RECONCILE_ADVISORY_LOCK_KEY,
     STUB_DONE,
     STUB_FAILED,
     STUB_OUTBOX_CHANNEL,
@@ -20,17 +23,20 @@ from core.stub_unit import (
     STUB_RUNNING,
     STUB_TERMINAL_STATES,
     STUB_UNIT_STATES,
+    STUCK_ALERT_EFFECT,
     ApplyTransitionResult,
     InvalidUnitStateError,
     LeaseLostError,
     UnitJobLease,
     UnsupportedResultError,
+    dead_alert_idempotency_key,
     lookup_transition,
     outbox_idempotency_key,
 )
 from ports.outbox_sender import OutboxMessage
 
 LEASE_TTL = timedelta(seconds=90)
+RECONCILE_LEASE_TTL = timedelta(seconds=30)
 
 
 class PostgresJobStore:
@@ -176,8 +182,12 @@ class PostgresJobStore:
         event: str,
         result: Any = None,
     ) -> ApplyTransitionResult:
-        if result is not None:
-            raise UnsupportedResultError("result must be None")
+        if result is not None and (
+            not isinstance(result, str) or result not in ALLOWED_APPLY_RESULTS
+        ):
+            raise UnsupportedResultError(
+                f"result must be None or one of {sorted(ALLOWED_APPLY_RESULTS)}"
+            )
 
         with self._conn.transaction():
             unit = self._conn.execute(
@@ -254,7 +264,7 @@ class PostgresJobStore:
                     "job_version": pre_bump_version,
                     "lease_id": str(lease.lease_id),
                     "effect": edge.effect,
-                    "result": None,
+                    "result": result,
                 }
             )
             self._conn.execute(
@@ -312,6 +322,282 @@ class PostgresJobStore:
                 job_version_after=job_version_after,
                 idempotency_key=idempotency_key,
             )
+
+    def try_reconcile_lock(self) -> bool:
+        # Commit immediately so we do not leave an open TX around the lease loop.
+        # Session advisory locks survive commit.
+        with self._conn.transaction():
+            row = self._conn.execute(
+                "SELECT pg_try_advisory_lock(%s) AS got",
+                (RECONCILE_ADVISORY_LOCK_KEY,),
+            ).fetchone()
+            assert row is not None
+            return bool(row["got"])
+
+    def release_reconcile_lock(self) -> None:
+        with self._conn.transaction():
+            self._conn.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (RECONCILE_ADVISORY_LOCK_KEY,),
+            )
+
+    def grace_force_clear_stale_leases(self) -> int:
+        with self._conn.transaction():
+            unit_cleared = self._conn.execute(
+                """
+                UPDATE jobs j
+                SET lease_id = NULL,
+                    leased_by = NULL,
+                    lease_expires_at = NULL,
+                    version = version + 1,
+                    updated_at = now()
+                FROM units u
+                WHERE j.kind = %s
+                  AND j.ref_id = u.id
+                  AND j.lease_expires_at IS NOT NULL
+                  AND j.lease_expires_at < now() - interval '5 minutes'
+                  AND u.state NOT IN (%s, %s)
+                  AND NOT (
+                      u.state = %s
+                      AND (
+                          j.attempts >= j.max_attempts
+                          OR (
+                              j.deadline_at IS NOT NULL
+                              AND j.deadline_at < now()
+                          )
+                      )
+                  )
+                RETURNING j.id
+                """,
+                (JOB_KIND_UNIT, STUB_DONE, STUB_FAILED, STUB_RUNNING),
+            ).fetchall()
+            run_cleared = self._conn.execute(
+                """
+                UPDATE jobs
+                SET lease_id = NULL,
+                    leased_by = NULL,
+                    lease_expires_at = NULL,
+                    version = version + 1,
+                    updated_at = now()
+                WHERE kind = %s
+                  AND lease_id IS NOT NULL
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < now() - interval '5 minutes'
+                RETURNING id
+                """,
+                (JOB_KIND_RUN,),
+            ).fetchall()
+            return len(unit_cleared) + len(run_cleared)
+
+    def select_stuck_unit_jobs(self) -> list[dict[str, Any]]:
+        with self._conn.transaction():
+            rows = self._conn.execute(
+                """
+                SELECT j.id AS job_id,
+                       j.version AS job_version,
+                       j.attempts AS attempts,
+                       j.max_attempts AS max_attempts,
+                       j.deadline_at AS deadline_at,
+                       (j.deadline_at IS NOT NULL AND j.deadline_at < now())
+                           AS deadline_passed,
+                       u.id AS unit_id,
+                       u.run_id AS run_id,
+                       u.state AS unit_state
+                FROM jobs j
+                JOIN units u ON u.id = j.ref_id
+                WHERE j.kind = %s
+                  AND u.state = %s
+                  AND (
+                      j.attempts >= j.max_attempts
+                      OR (j.deadline_at IS NOT NULL AND j.deadline_at < now())
+                  )
+                ORDER BY j.created_at ASC
+                FOR UPDATE OF j SKIP LOCKED
+                """,
+                (JOB_KIND_UNIT, STUB_RUNNING),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def steal_reconcile_lease(
+        self, job_id: UUID, worker_id: str
+    ) -> UnitJobLease | None:
+        with self._conn.transaction():
+            lease_id = uuid4()
+            row = self._conn.execute(
+                """
+                UPDATE jobs j
+                SET lease_id = %s,
+                    leased_by = %s,
+                    lease_expires_at = now() + %s::interval,
+                    version = version + 1,
+                    updated_at = now()
+                FROM units u
+                WHERE j.id = %s
+                  AND j.kind = %s
+                  AND j.ref_id = u.id
+                  AND u.state = %s
+                RETURNING j.id AS job_id,
+                          j.version AS job_version,
+                          j.lease_id AS lease_id,
+                          u.id AS unit_id,
+                          u.run_id AS run_id,
+                          u.state AS unit_state
+                """,
+                (
+                    lease_id,
+                    worker_id,
+                    RECONCILE_LEASE_TTL,
+                    job_id,
+                    JOB_KIND_UNIT,
+                    STUB_RUNNING,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            return UnitJobLease(
+                job_id=row["job_id"],
+                run_id=row["run_id"],
+                unit_id=row["unit_id"],
+                lease_id=row["lease_id"],
+                job_version=row["job_version"],
+                unit_state=row["unit_state"],
+                kind=JOB_KIND_UNIT,
+            )
+
+    def enqueue_stuck_alert(
+        self,
+        *,
+        run_id: UUID,
+        unit_id: UUID | None,
+        idempotency_key: str,
+        why: str,
+        kind: str,
+        ref_id: UUID,
+    ) -> bool:
+        with self._conn.transaction():
+            inserted = self._conn.execute(
+                """
+                INSERT INTO outbox (
+                    run_id, unit_id, channel, idempotency_key, payload, status
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, 'pending')
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    run_id,
+                    unit_id,
+                    STUB_OUTBOX_CHANNEL,
+                    idempotency_key,
+                    Jsonb(
+                        {
+                            "effect": STUCK_ALERT_EFFECT,
+                            "why": why,
+                            "kind": kind,
+                            "ref_id": str(ref_id),
+                        }
+                    ),
+                ),
+            ).fetchone()
+            return inserted is not None
+
+    def select_stuck_run_jobs(self) -> list[dict[str, Any]]:
+        with self._conn.transaction():
+            rows = self._conn.execute(
+                """
+                SELECT id AS job_id,
+                       ref_id AS run_id,
+                       version AS job_version,
+                       attempts AS attempts,
+                       max_attempts AS max_attempts,
+                       deadline_at AS deadline_at,
+                       (deadline_at IS NOT NULL AND deadline_at < now())
+                           AS deadline_passed,
+                       lease_id AS lease_id
+                FROM jobs
+                WHERE kind = %s
+                  AND (
+                      attempts >= max_attempts
+                      OR (deadline_at IS NOT NULL AND deadline_at < now())
+                  )
+                ORDER BY created_at ASC
+                FOR UPDATE OF jobs SKIP LOCKED
+                """,
+                (JOB_KIND_RUN,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def clear_run_lease_if_held(self, job_id: UUID) -> int | None:
+        with self._conn.transaction():
+            row = self._conn.execute(
+                """
+                UPDATE jobs
+                SET lease_id = NULL,
+                    leased_by = NULL,
+                    lease_expires_at = NULL,
+                    version = version + 1,
+                    updated_at = now()
+                WHERE id = %s
+                  AND kind = %s
+                  AND lease_id IS NOT NULL
+                RETURNING version - 1 AS pre_clear_version
+                """,
+                (job_id, JOB_KIND_RUN),
+            ).fetchone()
+            if row is None:
+                existing = self._conn.execute(
+                    "SELECT version FROM jobs WHERE id = %s AND kind = %s",
+                    (job_id, JOB_KIND_RUN),
+                ).fetchone()
+                if existing is None:
+                    return None
+                return int(existing["version"])
+            return int(row["pre_clear_version"])
+
+    def select_dead_outbox(self) -> list[dict[str, Any]]:
+        with self._conn.transaction():
+            rows = self._conn.execute(
+                """
+                SELECT id, run_id, unit_id, idempotency_key, payload
+                FROM outbox
+                WHERE status = 'dead'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def enqueue_dead_alert(
+        self,
+        *,
+        run_id: UUID,
+        unit_id: UUID | None,
+        dead_outbox_id: int,
+    ) -> bool:
+        key = dead_alert_idempotency_key(dead_outbox_id=dead_outbox_id)
+        with self._conn.transaction():
+            inserted = self._conn.execute(
+                """
+                INSERT INTO outbox (
+                    run_id, unit_id, channel, idempotency_key, payload, status
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, 'pending')
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    run_id,
+                    unit_id,
+                    STUB_OUTBOX_CHANNEL,
+                    key,
+                    Jsonb(
+                        {
+                            "effect": DEAD_ALERT_EFFECT,
+                            "dead_outbox_id": dead_outbox_id,
+                        }
+                    ),
+                ),
+            ).fetchone()
+            return inserted is not None
 
     def _bump_job_version(
         self,
