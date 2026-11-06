@@ -111,7 +111,8 @@ def test_process_kill_mid_hold_peer_reclaims(db_url, seed_unit_job, conn):
             with psycopg.connect(db_url, row_factory=dict_row) as c:
                 row = c.execute(
                     """
-                    SELECT u.state, j.lease_id, j.leased_by, j.lease_expires_at
+                    SELECT u.state, j.lease_id, j.leased_by,
+                           j.lease_expires_at > now() AS lease_live
                     FROM units u
                     JOIN jobs j ON j.ref_id = u.id AND j.kind = 'unit'
                     WHERE u.id = %s
@@ -123,7 +124,7 @@ def test_process_kill_mid_hold_peer_reclaims(db_url, seed_unit_job, conn):
                     and row["state"] == STUB_RUNNING
                     and row["lease_id"] is not None
                     and row["leased_by"] == "kill-victim"
-                    and row["lease_expires_at"] is not None
+                    and row["lease_live"] is True
                 ):
                     break
             time.sleep(0.05)
@@ -299,12 +300,22 @@ def test_reconcile_stuck_and_last_stop(conn, seed_unit_job, counts):
     ).fetchone()
     assert unit["state"] == STUB_FAILED
 
-    last = _last_stop(conn, ids["unit_id"])
-    assert last["event_type"] == "stub_fail"
-    why = last["payload"]["result"]
+    events = conn.execute(
+        """
+        SELECT event_type, payload FROM event_log WHERE unit_id = %s
+        """,
+        (ids["unit_id"],),
+    ).fetchall()
+    assert len(events) == 1
+    assert events[0]["event_type"] == "stub_fail"
+    why = events[0]["payload"]["result"]
     # Distinguishable criterion: attempts vs deadline (this path is attempts).
     assert why in {STUCK_WHY_ATTEMPTS, STUCK_WHY_DEADLINE}
     assert why == STUCK_WHY_ATTEMPTS
+
+    last = _last_stop(conn, ids["unit_id"])
+    assert last["event_type"] == "stub_fail"
+    assert last["payload"]["result"] == STUCK_WHY_ATTEMPTS
 
     alerts = _stuck_alert_rows(conn)
     assert len(alerts) == 1
@@ -316,6 +327,13 @@ def test_reconcile_stuck_and_last_stop(conn, seed_unit_job, counts):
     assert second.units_failed == 0
     assert counts() == before
     assert len(_stuck_alert_rows(conn)) == 1
+    assert (
+        conn.execute(
+            "SELECT count(*) AS n FROM event_log WHERE unit_id = %s",
+            (ids["unit_id"],),
+        ).fetchone()["n"]
+        == 1
+    )
 
 
 def test_reconcile_dead_outbox_alert_idempotent(conn, seed_dead_outbox):

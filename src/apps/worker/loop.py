@@ -35,7 +35,10 @@ _APPLY_ERRORS = (
 
 def _hold_seconds() -> float:
     """Optional ``BMAD_WORKER_HOLD_SECONDS`` kill window; default 0 (off)."""
-    return float(os.environ.get("BMAD_WORKER_HOLD_SECONDS", "0"))
+    raw = os.environ.get("BMAD_WORKER_HOLD_SECONDS")
+    if raw is None or raw.strip() == "":
+        return 0.0
+    return float(raw)
 
 
 def handle_unit(store: JobStorePort, lease: UnitJobLease, worker_id: str) -> int:
