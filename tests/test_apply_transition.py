@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from adapters.postgres import PostgresJobStore
 from core.stub_unit import (
@@ -465,3 +469,156 @@ def test_missing_job_raises(conn, seed_unit_job, counts):
     ).fetchone()
     assert unit["state"] == STUB_READY
     assert counts() == {"event_log": 0, "outbox": 0}
+
+
+def test_concurrent_same_lease_apply(db_url, seed_unit_job, conn):
+    """Two threads apply the same held lease: one winner write path, loser zero writes."""
+    ids = seed_unit_job(state=STUB_RUNNING)
+    lease_id = uuid4()
+    worker = "w-concurrent"
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_id = %s,
+                leased_by = %s,
+                lease_expires_at = now() + interval '90 seconds',
+                version = version + 1
+            WHERE id = %s
+            """,
+            (lease_id, worker, ids["job_id"]),
+        )
+    job = conn.execute(
+        "SELECT version, lease_id FROM jobs WHERE id = %s", (ids["job_id"],)
+    ).fetchone()
+    lease = UnitJobLease(
+        job_id=ids["job_id"],
+        run_id=ids["run_id"],
+        unit_id=ids["unit_id"],
+        lease_id=job["lease_id"],
+        job_version=job["version"],
+        unit_state=STUB_RUNNING,
+    )
+    conn.commit()
+
+    results: list = []
+    errors: list = []
+    barrier = threading.Barrier(2)
+
+    def rival() -> None:
+        try:
+            with psycopg.connect(db_url, row_factory=dict_row) as c:
+                store = PostgresJobStore(c)
+                barrier.wait(timeout=10)
+                try:
+                    results.append(store.apply_transition(lease, worker, STUB_COMPLETE))
+                except LeaseLostError as exc:
+                    errors.append(exc)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(rival), pool.submit(rival)]
+        for f in futs:
+            f.result(timeout=30)
+
+    assert len(results) == 1, (results, errors)
+    assert len(errors) == 1, (results, errors)
+    assert isinstance(errors[0], LeaseLostError)
+
+    with psycopg.connect(db_url, row_factory=dict_row) as c:
+        unit = c.execute(
+            "SELECT state FROM units WHERE id = %s", (ids["unit_id"],)
+        ).fetchone()
+        assert unit["state"] == STUB_DONE
+        event_n = c.execute(
+            "SELECT count(*) AS n FROM event_log WHERE unit_id = %s",
+            (ids["unit_id"],),
+        ).fetchone()["n"]
+        outbox_n = c.execute(
+            "SELECT count(*) AS n FROM outbox WHERE unit_id = %s",
+            (ids["unit_id"],),
+        ).fetchone()["n"]
+    assert event_n == 1
+    assert outbox_n == 1
+
+
+def test_stale_version_outbox_dedupe(conn, seed_unit_job, counts):
+    """After a successful apply, stale job_version fails closed with no second outbox row."""
+    ids = seed_unit_job()
+    store = PostgresJobStore(conn)
+    lease = store.lease_next("w")
+    assert lease is not None
+    start = store.apply_transition(lease, "w", STUB_START)
+    held = replace(
+        lease, job_version=start.job_version_after, unit_state=start.to_state
+    )
+    pre_complete_version = held.job_version
+    expected_key = outbox_idempotency_key(
+        unit_id=ids["unit_id"],
+        effect=STUB_EFFECT,
+        transition_version=pre_complete_version,
+    )
+    complete = store.apply_transition(held, "w", STUB_COMPLETE)
+    assert complete.idempotency_key == expected_key
+    assert counts() == {"event_log": 2, "outbox": 1}
+
+    stale = replace(held, job_version=pre_complete_version)
+    with pytest.raises(LeaseLostError):
+        store.apply_transition(stale, "w", STUB_COMPLETE)
+    assert counts() == {"event_log": 2, "outbox": 1}
+    rows = conn.execute(
+        "SELECT count(*) AS n FROM outbox WHERE idempotency_key = %s",
+        (expected_key,),
+    ).fetchone()
+    assert rows["n"] == 1
+
+
+def test_lease_expiry_equality_boundary(conn, seed_unit_job, counts):
+    """At lease_expires_at == now() (TX-stable): reclaimable; heartbeat/apply lost."""
+    ids = seed_unit_job(state=STUB_RUNNING)
+    lease_id = uuid4()
+    worker = "w-eq"
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_id = %s,
+                leased_by = %s,
+                lease_expires_at = now() + interval '90 seconds',
+                version = version + 1
+            WHERE id = %s
+            """,
+            (lease_id, worker, ids["job_id"]),
+        )
+    job = conn.execute(
+        "SELECT version, lease_id FROM jobs WHERE id = %s", (ids["job_id"],)
+    ).fetchone()
+    lease = UnitJobLease(
+        job_id=ids["job_id"],
+        run_id=ids["run_id"],
+        unit_id=ids["unit_id"],
+        lease_id=job["lease_id"],
+        job_version=job["version"],
+        unit_state=STUB_RUNNING,
+    )
+    store = PostgresJobStore(conn)
+
+    # Outer TX keeps Postgres now() stable across nested store savepoints.
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_expires_at = now()
+            WHERE id = %s
+            """,
+            (ids["job_id"],),
+        )
+        assert store.heartbeat(ids["job_id"], lease.lease_id, worker) is False
+        with pytest.raises(LeaseLostError, match="lease expired"):
+            store.apply_transition(lease, worker, STUB_COMPLETE)
+        assert counts() == {"event_log": 0, "outbox": 0}
+        reclaimed = store.lease_next(worker)
+        assert reclaimed is not None
+        assert reclaimed.job_id == ids["job_id"]
+        assert reclaimed.unit_state == STUB_RUNNING
