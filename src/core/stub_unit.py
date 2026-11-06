@@ -23,6 +23,9 @@ STUB_NOTIFY = "stub_notify"
 
 STUB_OUTBOX_CHANNEL = "stub"
 
+JOB_KIND_UNIT: Final[str] = "unit"
+JOB_KIND_RUN: Final[str] = "run"
+
 STUB_UNIT_STATES: Final[frozenset[str]] = frozenset(
     {
         STUB_READY,
@@ -53,12 +56,19 @@ class UnsupportedResultError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class UnitJobLease:
+    """Lease claim DTO for the shared typed-job pool.
+
+    Unit path: ``kind=unit`` with ``run_id`` / ``unit_id`` / ``unit_state`` set.
+    Run path: ``kind=run`` with ``run_id`` = job ``ref_id``; unit fields unused.
+    """
+
     job_id: UUID
     run_id: UUID
     unit_id: UUID
     lease_id: UUID
     job_version: int
     unit_state: str
+    kind: str = JOB_KIND_UNIT
 
 
 @dataclass(frozen=True, slots=True)

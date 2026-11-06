@@ -20,9 +20,9 @@ States on **`units.state`** (CHECK widened in migration `0003`):
 
 | State           | Meaning                                              |
 | --------------- | ---------------------------------------------------- |
-| `stub_ready`    | Actionable; `lease_next` claims only this state      |
-| `stub_running`  | Work in progress under a held lease                  |
-| `stub_paused`   | Paused under a held lease                            |
+| `stub_ready`    | Actionable; claimable when lease null/expired        |
+| `stub_running`  | In progress; reclaimable when lease null/expired     |
+| `stub_paused`   | Paused; never claimed by `lease_next`                |
 | `stub_done`     | Terminal success; lease cleared on entry             |
 | `stub_failed`   | Terminal failure; lease cleared on entry             |
 
@@ -42,7 +42,9 @@ Normative table and errors live in `src/core/stub_unit.py`. `jobs` is the lease/
 
 On success: bump `jobs.version` every apply; **retain** `lease_id` / `leased_by` / `lease_expires_at` on non-terminal targets; **clear** lease only on `stub_done` / `stub_failed`. Append `event_log` with `event_type` equal to the SM event string; JSONB `payload` keys `job_version` (pre-bump), `lease_id`, `effect`, `result` (always `null`). Optional outbox row when the edge carries an effect.
 
-**Worker (tracer):** one lease → `stub_start` → `dataclasses.replace(lease, job_version=…)` → `stub_complete`. Exit codes: `0` full cycle applied, `1` apply error (lease/SM), `2` idle (empty queue). No terminal no-op.
+**Lease pool:** `JobStorePort.lease_next(worker_id)` claims one job from the shared `kind∈{run,unit}` pool (`FOR UPDATE SKIP LOCKED`, default TTL 90s, injectable). Unit claimable when `stub_ready` **or** `stub_running` with lease null/expired — never `stub_paused` / terminal. Run claimable when lease null/expired. `heartbeat(job_id, lease_id, worker_id)` extends `lease_expires_at` by TTL on match (0 rows → handler stops, no further apply/release). `release(job_id, lease_id)` clears lease columns only when `lease_id` still matches.
+
+**Worker loop:** continuous poll by default (idle sleep ≤1s); `--once` does one claim+dispatch then exit. Dispatch by `kind`: unit `stub_ready` → `stub_start` then `stub_complete` (with `replace` version/state refresh + heartbeat between); reclaimed `stub_running` → `stub_complete` only; run → no-op `release` (no Unit SM / event_log / outbox). Stub run claim skips jobs already released after a successful claim (so the loop does not starve units); expired mid-hold run leases remain reclaimable until Run SM exists. Exit codes for `--once`: `0` dispatched, `1` apply/handler error, `2` idle.
 
 ## Outbox (AD-16)
 
@@ -81,7 +83,7 @@ Do not copy the handoff `ai-factory/` tree verbatim.
 
 ## Local verify
 
-Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad` is local-dev). Override with `DATABASE_URL` outside that compose stack. Worker and outbox stay host-side one-shots for the tracer.
+Compose publishes Postgres only (bound to `127.0.0.1:5432`; default `bmad`/`bmad` is local-dev). Override with `DATABASE_URL` outside that compose stack. Worker is a host-side continuous lease loop (`--once` for one-shot); outbox stays a host-side one-shot stub.
 
 Postgres 18 mounts the named volume at `/var/lib/postgresql` (not `/var/lib/postgresql/data`). After pulling that compose change, reset the old volume once: `docker compose down -v` (destroys local DB data), then `docker compose up -d`.
 
@@ -98,9 +100,10 @@ uv run mypy                        # files=["src"]; non-strict
 docker compose up -d
 uv run alembic upgrade head
 uv run python scripts/seed_dev.py  # truncates then seeds one cycle; --keep to append
-uv run python -m apps.worker       # exit 0 cycle / 1 apply error / 2 idle
+uv run python -m apps.worker --once  # exit 0 dispatched / 1 error / 2 idle
+uv run python -m apps.worker         # continuous poll until stopped
 uv run python -m apps.outbox
-uv run pytest
+uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, run no-op
 ```
 
 ### Local verify quality

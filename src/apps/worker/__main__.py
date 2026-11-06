@@ -1,59 +1,52 @@
-"""Run one stub unit cycle: lease → stub_start → stub_complete (one hold).
+"""Worker composition root: continuous lease loop (default) or ``--once``.
 
-Exit codes: 0 applied full cycle, 1 lease/SM apply error, 2 idle (empty queue).
+Exit codes for ``--once``: 0 applied/dispatched, 1 lease/SM/handler error, 2 idle.
+Continuous mode polls until stopped (SIGINT) or a non-idle handler error.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
-from dataclasses import replace
 
 from adapters.postgres import PostgresJobStore, connect
-from core.stub_unit import (
-    STUB_COMPLETE,
-    STUB_START,
-    IllegalTransitionError,
-    InvalidUnitStateError,
-    LeaseLostError,
-    UnsupportedResultError,
-)
+from apps.worker.loop import claim_and_dispatch, run_poll_loop
 
 
 def run_once(worker_id: str | None = None) -> int:
+    """One claim+dispatch then exit (seed / AGENT / ``--once``)."""
     worker_id = worker_id or os.environ.get("WORKER_ID", "worker-1")
     with connect() as conn:
         store = PostgresJobStore(conn)
-        lease = store.lease_next_unit_job(worker_id)
-        if lease is None:
-            print("no actionable unit job", file=sys.stderr)
-            return 2
+        code = claim_and_dispatch(store, worker_id)
+        if code == 2:
+            print("no actionable job", file=sys.stderr)
+        return code
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Shared typed-job worker: lease loop for kind∈{run,unit}."
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Claim and dispatch at most one job, then exit",
+    )
+    args = parser.parse_args(argv)
+    worker_id = os.environ.get("WORKER_ID", "worker-1")
+
+    if args.once:
+        raise SystemExit(run_once(worker_id))
+
+    with connect() as conn:
+        store = PostgresJobStore(conn)
         try:
-            start = store.apply_transition(lease, worker_id, STUB_START)
-            lease = replace(
-                lease,
-                job_version=start.job_version_after,
-                unit_state=start.to_state,
-            )
-            complete = store.apply_transition(lease, worker_id, STUB_COMPLETE)
-        except (
-            LeaseLostError,
-            IllegalTransitionError,
-            InvalidUnitStateError,
-            UnsupportedResultError,
-        ) as exc:
-            print(f"apply failed: {exc}", file=sys.stderr)
-            return 1
-        print(
-            f"applied {start.from_state}→{start.to_state} then "
-            f"{complete.from_state}→{complete.to_state} "
-            f"key={complete.idempotency_key}"
-        )
-        return 0
-
-
-def main() -> None:
-    raise SystemExit(run_once())
+            raise SystemExit(run_poll_loop(store, worker_id, once=False))
+        except KeyboardInterrupt:
+            print("worker stopped", file=sys.stderr)
+            raise SystemExit(0) from None
 
 
 if __name__ == "__main__":

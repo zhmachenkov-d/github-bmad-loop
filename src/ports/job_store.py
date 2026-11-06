@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 from typing import Any, Protocol
+from uuid import UUID
 
 from core.stub_unit import ApplyTransitionResult, UnitJobLease
 
 
 class JobStorePort(Protocol):
-    def lease_next_unit_job(self, worker_id: str) -> UnitJobLease | None:
-        """Short TX: claim one actionable unit job with FOR UPDATE SKIP LOCKED."""
+    def lease_next(self, worker_id: str) -> UnitJobLease | None:
+        """Short TX: claim one actionable run|unit job with FOR UPDATE SKIP LOCKED."""
+
+    def heartbeat(self, job_id: UUID, lease_id: UUID, worker_id: str) -> bool:
+        """Extend lease_expires_at by TTL when job+lease+worker match. False if 0 rows."""
+
+    def release(self, job_id: UUID, lease_id: UUID) -> bool:
+        """Clear lease columns when lease_id still matches. False if 0 rows."""
 
     def apply_transition(
         self,

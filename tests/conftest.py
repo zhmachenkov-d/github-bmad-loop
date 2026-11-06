@@ -17,7 +17,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from core.stub_unit import STUB_READY
+from core.stub_unit import JOB_KIND_RUN, JOB_KIND_UNIT, STUB_READY
 
 DEFAULT_URL = "postgresql://bmad:bmad@127.0.0.1:5432/bmad"
 
@@ -80,11 +80,57 @@ def seed_unit_job(conn):
             conn.execute(
                 """
                 INSERT INTO jobs (id, kind, ref_id, version)
-                VALUES (%s, 'unit', %s, 0)
+                VALUES (%s, %s, %s, 0)
                 """,
-                (job_id, unit_id),
+                (job_id, JOB_KIND_UNIT, unit_id),
             )
         return {"run_id": run_id, "unit_id": unit_id, "job_id": job_id}
+
+    return _seed
+
+
+@pytest.fixture
+def seed_run_job(conn):
+    def _seed() -> dict:
+        run_id = uuid4()
+        job_id = uuid4()
+        with conn.transaction():
+            conn.execute("INSERT INTO runs (id) VALUES (%s)", (run_id,))
+            conn.execute(
+                """
+                INSERT INTO jobs (id, kind, ref_id, version)
+                VALUES (%s, %s, %s, 0)
+                """,
+                (job_id, JOB_KIND_RUN, run_id),
+            )
+        return {"run_id": run_id, "job_id": job_id}
+
+    return _seed
+
+
+@pytest.fixture
+def seed_fleet_unit_jobs(conn):
+    def _seed(n: int = 100) -> list[dict]:
+        rows: list[dict] = []
+        with conn.transaction():
+            for _ in range(n):
+                run_id = uuid4()
+                unit_id = uuid4()
+                job_id = uuid4()
+                conn.execute("INSERT INTO runs (id) VALUES (%s)", (run_id,))
+                conn.execute(
+                    "INSERT INTO units (id, run_id, state) VALUES (%s, %s, %s)",
+                    (unit_id, run_id, STUB_READY),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO jobs (id, kind, ref_id, version)
+                    VALUES (%s, %s, %s, 0)
+                    """,
+                    (job_id, JOB_KIND_UNIT, unit_id),
+                )
+                rows.append({"run_id": run_id, "unit_id": unit_id, "job_id": job_id})
+        return rows
 
     return _seed
 

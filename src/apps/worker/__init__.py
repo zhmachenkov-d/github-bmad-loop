@@ -1,1 +1,1 @@
-"""Stub worker process: lease one unit job and apply the stub transition once."""
+"""Leased worker composition root: shared run|unit pool loop."""

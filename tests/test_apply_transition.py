@@ -79,7 +79,7 @@ def _lease_and_apply(
             unit_state=from_state,
         )
     else:
-        lease = store.lease_next_unit_job(worker)
+        lease = store.lease_next(worker)
         assert lease is not None
     return ids, lease, store.apply_transition(lease, worker, event)
 
@@ -249,7 +249,7 @@ def test_stale_lease_before_illegal_transition(conn, seed_unit_job, counts):
     """Guard order: bad lease/version must fail before SM table (illegal event)."""
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     stale = replace(lease, job_version=lease.job_version - 1)
     with pytest.raises(LeaseLostError):
@@ -265,7 +265,7 @@ def test_leased_by_mismatch_before_illegal_transition(conn, seed_unit_job, count
     """Guard order: wrong worker_id must fail before SM table (illegal event)."""
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     with pytest.raises(LeaseLostError, match="leased_by mismatch"):
         store.apply_transition(lease, "other-worker", STUB_COMPLETE)
@@ -279,7 +279,7 @@ def test_leased_by_mismatch_before_illegal_transition(conn, seed_unit_job, count
 def test_unsupported_result(conn, seed_unit_job, counts):
     seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     with pytest.raises(UnsupportedResultError):
         store.apply_transition(lease, "w", STUB_START, result={"x": 1})
@@ -289,7 +289,7 @@ def test_unsupported_result(conn, seed_unit_job, counts):
 def test_corrupt_unit_state(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     conn.execute("ALTER TABLE units DROP CONSTRAINT units_state_check")
     try:
@@ -345,7 +345,7 @@ def test_stale_lease_after_terminal_clear(conn, seed_unit_job, counts):
 def test_version_refresh_between_applies(conn, seed_unit_job):
     seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     v0 = lease.job_version
     start = store.apply_transition(lease, "w", STUB_START)
@@ -360,7 +360,7 @@ def test_version_refresh_between_applies(conn, seed_unit_job):
 def test_expired_lease_raises(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     with conn.transaction():
         conn.execute(
@@ -383,7 +383,7 @@ def test_expired_lease_raises(conn, seed_unit_job, counts):
 def test_cleared_lease_raises(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     with conn.transaction():
         conn.execute(
@@ -404,7 +404,7 @@ def test_cleared_lease_raises(conn, seed_unit_job, counts):
 def test_missing_unit_raises(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     with conn.transaction():
         conn.execute("DELETE FROM jobs WHERE id = %s", (ids["job_id"],))
@@ -417,7 +417,7 @@ def test_missing_unit_raises(conn, seed_unit_job, counts):
 def test_missing_job_raises(conn, seed_unit_job, counts):
     ids = seed_unit_job()
     store = PostgresJobStore(conn)
-    lease = store.lease_next_unit_job("w")
+    lease = store.lease_next("w")
     assert lease is not None
     with conn.transaction():
         conn.execute("DELETE FROM jobs WHERE id = %s", (ids["job_id"],))
