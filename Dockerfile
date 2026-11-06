@@ -12,10 +12,14 @@ COPY alembic ./alembic
 COPY alembic.ini ./
 COPY scripts ./scripts
 
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev \
+ && useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin app \
+ && chown -R app:app /app
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
+
+USER app
 
 # Compose overrides `command` per service.
 CMD ["python", "-m", "apps.worker"]

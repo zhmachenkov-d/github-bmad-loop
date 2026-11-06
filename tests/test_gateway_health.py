@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
-
 from apps.gateway import __main__ as gateway_main
 from apps.gateway.app import app, health
+from fastapi.testclient import TestClient
 
 
 def test_health_returns_200() -> None:
@@ -22,8 +21,10 @@ def test_health_handler_status_directly() -> None:
 
 def test_unknown_path_is_not_ingress() -> None:
     client = TestClient(app)
-    response = client.post("/slack/events", json={})
-    assert response.status_code == 404
+    assert client.post("/slack/events", json={}).status_code == 404
+    assert client.post("/github/webhooks", json={}).status_code == 404
+    assert client.get("/panel").status_code == 404
+    assert client.post("/signals", json={}).status_code == 404
 
 
 def test_main_runs_uvicorn_with_defaults(monkeypatch) -> None:
@@ -61,3 +62,34 @@ def test_main_respects_gateway_env(monkeypatch) -> None:
     monkeypatch.setattr(gateway_main.uvicorn, "run", fake_run)
     gateway_main.main()
     assert captured == {"host": "127.0.0.1", "port": 9090}
+
+
+def test_main_treats_empty_gateway_env_as_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("GATEWAY_HOST", "")
+    monkeypatch.setenv("GATEWAY_PORT", "")
+    captured: dict[str, object] = {}
+
+    def fake_run(app_path: str, *, host: str, port: int, factory: bool) -> None:
+        del app_path, factory
+        captured["host"] = host
+        captured["port"] = port
+
+    monkeypatch.setattr(gateway_main.uvicorn, "run", fake_run)
+    gateway_main.main()
+    assert captured == {"host": "0.0.0.0", "port": 8080}
+
+
+def test_main_rejects_non_integer_gateway_port(monkeypatch) -> None:
+    monkeypatch.setenv("GATEWAY_PORT", "abc")
+
+    def fake_run(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("uvicorn.run must not be called")
+
+    monkeypatch.setattr(gateway_main.uvicorn, "run", fake_run)
+    try:
+        gateway_main.main()
+    except SystemExit as exc:
+        assert "GATEWAY_PORT" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")

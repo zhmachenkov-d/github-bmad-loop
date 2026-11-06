@@ -20,23 +20,23 @@ Hexagonal control plane (architecture spine Structural Seed):
 
 States on **`units.state`** (CHECK widened in migration `0003`):
 
-| State           | Meaning                                              |
-| --------------- | ---------------------------------------------------- |
-| `stub_ready`    | Actionable; claimable when lease null/expired        |
-| `stub_running`  | In progress; reclaimable when lease null/expired     |
-| `stub_paused`   | Paused; never claimed by `lease_next`                |
-| `stub_done`     | Terminal success; lease cleared on entry             |
-| `stub_failed`   | Terminal failure; lease cleared on entry             |
+| State          | Meaning                                          |
+| -------------- | ------------------------------------------------ |
+| `stub_ready`   | Actionable; claimable when lease null/expired    |
+| `stub_running` | In progress; reclaimable when lease null/expired |
+| `stub_paused`  | Paused; never claimed by `lease_next`            |
+| `stub_done`    | Terminal success; lease cleared on entry         |
+| `stub_failed`  | Terminal failure; lease cleared on entry         |
 
 Declared edges (anything else → `IllegalTransitionError`):
 
-| From            | Event            | To              | Outbox effect   |
-| --------------- | ---------------- | --------------- | --------------- |
-| `stub_ready`    | `stub_start`     | `stub_running`  | —               |
-| `stub_running`  | `stub_complete`  | `stub_done`     | `stub_effect`   |
-| `stub_running`  | `stub_pause`     | `stub_paused`   | `stub_notify`   |
-| `stub_paused`   | `stub_resume`    | `stub_running`  | —               |
-| `stub_running`  | `stub_fail`      | `stub_failed`   | `stub_effect`   |
+| From           | Event           | To             | Outbox effect |
+| -------------- | --------------- | -------------- | ------------- |
+| `stub_ready`   | `stub_start`    | `stub_running` | —             |
+| `stub_running` | `stub_complete` | `stub_done`    | `stub_effect` |
+| `stub_running` | `stub_pause`    | `stub_paused`  | `stub_notify` |
+| `stub_paused`  | `stub_resume`   | `stub_running` | —             |
+| `stub_running` | `stub_fail`     | `stub_failed`  | `stub_effect` |
 
 Normative table and errors live in `src/core/stub_unit.py`. `jobs` is the lease/work queue only (`kind` ∈ `{run,unit}`, `ref_id`, lease columns, `version`); it does **not** store SM state.
 
@@ -92,28 +92,32 @@ Required env **names** (values never committed; see `.env.example`):
 - `POSTGRES_USER`
 - `POSTGRES_PASSWORD`
 - `POSTGRES_DB`
-- `DATABASE_URL` — host-side debug only (`127.0.0.1`); Compose app services build the URL with host `postgres` from `POSTGRES_*`
+- `DATABASE_URL` — pre-encoded URL for Compose apps (`migrate` / `worker` / `outbox` / `gateway`); use host `postgres`. Host-side debug may use `127.0.0.1` instead. Percent-encode special characters in user/password.
 - `WORKER_ID`
 
-Copy `.env.example` → `.env`, fill values, never commit `.env`. Laptop defaults such as `bmad`/`bmad` are local-dev only — **not** shared-host / prod posture.
+Copy `.env.example` → `.env`, fill values, never commit `.env`. Empty values fail closed (`${VAR:?…}` in Compose). Laptop defaults such as `bmad`/`bmad` are local-dev only — **not** shared-host / prod posture.
 
-Compose builds app `DATABASE_URL` by interpolating `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` with no URL-encoding. Keep those values URL-safe (no `:`, `@`, `/`, `?`, `#`, `%`, or spaces), or percent-encode special characters in any manually supplied `DATABASE_URL`.
+Do **not** build app `DATABASE_URL` by interpolating `POSTGRES_*` in Compose — set a single pre-encoded `DATABASE_URL` in `.env` (Compose DNS host `postgres` for services).
 
 ## Local verify
 
 Documented bring-up is Compose-first (AD-7): one topology for local and shared host.
 
 ```bash
-cp .env.example .env   # fill POSTGRES_* / WORKER_ID / DATABASE_URL (host debug)
+cp .env.example .env   # fill POSTGRES_* / WORKER_ID / DATABASE_URL (host postgres for Compose)
 docker compose up -d --build
 docker compose ps      # migrate exited 0; postgres/worker/outbox/gateway running
 curl -sf http://127.0.0.1:8080/health
 docker compose run --rm worker python scripts/seed_dev.py
-# wait for continuous worker+outbox, then:
-docker compose exec postgres sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"'
-docker compose exec postgres sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"'
+# poll until stub cycle lands (timeout ~60s):
+for i in $(seq 1 30); do
+  state=$(docker compose exec -T postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"' || true)
+  status=$(docker compose exec -T postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"' || true)
+  if [ "$state" = "stub_done" ] && [ "$status" = "sent" ]; then echo "ok: $state / $status"; break; fi
+  sleep 2
+done
 # expect unit state stub_done and outbox status sent
 ```
 
@@ -172,7 +176,7 @@ Stack pins: Python 3.14, PostgreSQL 18, sync psycopg 3.3.x, SQLAlchemy 2.x + Ale
 Persistent founding-team Linux host (not laptop, not throwaway Codespace-as-factory). Same Compose topology — no profiles.
 
 1. Clone or pull this repo on the host.
-2. `cp .env.example .env` and fill non-laptop credentials (`POSTGRES_*`, `WORKER_ID`; do not reuse default laptop `bmad`/`bmad` as shared-host posture). `DATABASE_URL` is optional on the host when using only Compose services (apps get URL via Compose DNS `postgres`).
+2. `cp .env.example .env` and fill non-laptop credentials (`POSTGRES_*`, `WORKER_ID`, pre-encoded `DATABASE_URL` with host `postgres`; do not reuse default laptop `bmad`/`bmad` as shared-host posture). Empty values fail closed at `docker compose up`.
 3. Bring-up (migrate completes before apps start):
 
 ```bash
@@ -187,16 +191,15 @@ curl -sf http://127.0.0.1:8080/health
 
 ```bash
 docker compose run --rm worker python scripts/seed_dev.py
-# continuous worker/outbox Compose services process the cycle
-```
-
-Confirm with runbook queries (not a full log dump):
-
-```bash
-docker compose exec postgres sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"'
-docker compose exec postgres sh -c \
-  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"'
+# poll until stub cycle lands (timeout ~60s):
+for i in $(seq 1 30); do
+  state=$(docker compose exec -T postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"' || true)
+  status=$(docker compose exec -T postgres sh -c \
+    'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"' || true)
+  if [ "$state" = "stub_done" ] && [ "$status" = "sent" ]; then echo "ok: $state / $status"; break; fi
+  sleep 2
+done
 ```
 
 Expect `stub_done` and `sent`.
@@ -211,4 +214,3 @@ Implementer ships empty slots. A person fills these on the founding-team shared 
    - _(empty)_
 3. Seeded cycle: unit `stub_done` + outbox `sent` (runbook commands above):
    - _(empty)_
-
