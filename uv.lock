@@ -555,6 +555,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "hypothesis" },
     { name = "mutmut" },
     { name = "mypy" },
@@ -568,6 +569,7 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.20,<2" },
     { name = "fastapi", specifier = ">=0.120,<1" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6" },
     { name = "mutmut", marker = "extra == 'dev'", specifier = ">=3" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.18" },

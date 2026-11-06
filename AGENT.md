@@ -97,6 +97,8 @@ Required env **names** (values never committed; see `.env.example`):
 
 Copy `.env.example` → `.env`, fill values, never commit `.env`. Laptop defaults such as `bmad`/`bmad` are local-dev only — **not** shared-host / prod posture.
 
+Compose builds app `DATABASE_URL` by interpolating `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` with no URL-encoding. Keep those values URL-safe (no `:`, `@`, `/`, `?`, `#`, `%`, or spaces), or percent-encode special characters in any manually supplied `DATABASE_URL`.
+
 ## Local verify
 
 Documented bring-up is Compose-first (AD-7): one topology for local and shared host.
@@ -108,12 +110,10 @@ docker compose ps      # migrate exited 0; postgres/worker/outbox/gateway runnin
 curl -sf http://127.0.0.1:8080/health
 docker compose run --rm worker python scripts/seed_dev.py
 # wait for continuous worker+outbox, then:
-docker compose exec postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"
-docker compose exec postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"
+docker compose exec postgres sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"'
+docker compose exec postgres sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"'
 # expect unit state stub_done and outbox status sent
 ```
 
@@ -137,12 +137,35 @@ uv run python -m apps.worker         # continuous poll + 60s reconcile until sto
 uv run python -m apps.outbox --once  # exit 0 processed / 2 idle; claim→send batch
 uv run python -m apps.outbox         # continuous poll until stopped
 uv run python -m apps.gateway        # health stub on :8080
-uv run pytest                        # includes fleet 2×100, heartbeat, reclaim, outbox, reconcile, gateway /health
+uv run pytest                        # uses DATABASE_URL from the environment / repo `.env` (loaded by conftest when present; does not override already-set env)
 ```
 
 Everyday CI gates (ruff check, ruff format --check, mypy on `src/`, pytest with Postgres) live in `.github/workflows/ci.yml` on `pull_request` and `push`. Install the format-on-commit hook once; ruff check / mypy / pytest stay CI-only (not pre-commit hooks). Keep `.pre-commit-config.yaml` `rev` equal to the locked `ruff` version in `uv.lock`. Pre-commit stays **ruff format only** — Semgrep and mutmut are not hooks.
 
 Quality bar CI (AD-15 / R16) lives in `.github/workflows/quality-pr.yml` (PR/push Semgrep + diff mutmut) and `.github/workflows/quality-mutmut-schedule.yml` (Monday / `workflow_dispatch` full mutmut). Glue under `.ci/` is not package code. Owner Slack on worsen uses `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID` via `chat.postMessage` (not a webhook); missing secrets skip notify without failing the job.
+
+### Local verify quality
+
+```bash
+# Semgrep (AST-diff / baseline compare)
+uv run python .ci/run_semgrep.py
+uv run python .ci/run_semgrep.py --baseline-commit <base-sha>
+uv run python .ci/run_semgrep.py --compare-baseline
+# intentional bump only: uv run python .ci/run_semgrep.py --write-baseline
+
+# Mutmut (diff survivors do not fail; full: score drop ≥ 1 or survived/no_tests growth fails)
+uv run python .ci/run_mutmut_diff.py
+uv run python .ci/run_mutmut_diff.py --base-ref <base-sha>
+uv run python .ci/run_mutmut_full.py --compare-baseline
+# intentional bump only: uv run python .ci/run_mutmut_full.py --write-baseline
+
+# HITL worsen fixture (dry-run Slack payload; no secrets required)
+uv run python .ci/run_worsen_fixture.py
+```
+
+Baseline bump rule: see `.ci/README.md` — only edit `.ci/baselines/` when intentionally accepting a new Semgrep finding or a lower mutmut score / higher survived or no_tests count. Hypothesis is a `dev` dependency for when property-based tests are earned later; not required on every change.
+
+Stack pins: Python 3.14, PostgreSQL 18, sync psycopg 3.3.x, SQLAlchemy 2.x + Alembic.
 
 ## Deploy (shared factory host)
 
@@ -170,12 +193,10 @@ docker compose run --rm worker python scripts/seed_dev.py
 Confirm with runbook queries (not a full log dump):
 
 ```bash
-docker compose exec postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"
-docker compose exec postgres \
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"
+docker compose exec postgres sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT state FROM units ORDER BY created_at DESC LIMIT 1;"'
+docker compose exec postgres sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT status FROM outbox ORDER BY id DESC LIMIT 1;"'
 ```
 
 Expect `stub_done` and `sent`.
@@ -191,26 +212,3 @@ Implementer ships empty slots. A person fills these on the founding-team shared 
 3. Seeded cycle: unit `stub_done` + outbox `sent` (runbook commands above):
    - _(empty)_
 
-
-### Local verify quality
-
-```bash
-# Semgrep (AST-diff / baseline compare)
-uv run python .ci/run_semgrep.py
-uv run python .ci/run_semgrep.py --baseline-commit <base-sha>
-uv run python .ci/run_semgrep.py --compare-baseline
-# intentional bump only: uv run python .ci/run_semgrep.py --write-baseline
-
-# Mutmut (diff survivors do not fail; full: score drop ≥ 1 or survived/no_tests growth fails)
-uv run python .ci/run_mutmut_diff.py
-uv run python .ci/run_mutmut_diff.py --base-ref <base-sha>
-uv run python .ci/run_mutmut_full.py --compare-baseline
-# intentional bump only: uv run python .ci/run_mutmut_full.py --write-baseline
-
-# HITL worsen fixture (dry-run Slack payload; no secrets required)
-uv run python .ci/run_worsen_fixture.py
-```
-
-Baseline bump rule: see `.ci/README.md` — only edit `.ci/baselines/` when intentionally accepting a new Semgrep finding or a lower mutmut score / higher survived or no_tests count. Hypothesis is a `dev` dependency for when property-based tests are earned later; not required on every change.
-
-Stack pins: Python 3.14, PostgreSQL 18, sync psycopg 3.3.x, SQLAlchemy 2.x + Alembic.

@@ -23,6 +23,24 @@ from core.stub_unit import JOB_KIND_RUN, JOB_KIND_UNIT, STUB_READY
 DEFAULT_URL = "postgresql://bmad:bmad@127.0.0.1:5432/bmad"
 
 
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE from repo `.env` without overriding already-set env."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip("'").strip('"')
+
+
+_load_dotenv(ROOT / ".env")
+
+
 def _wait_for_db(url: str, attempts: int = 30) -> None:
     last: Exception | None = None
     for _ in range(attempts):
