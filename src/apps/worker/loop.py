@@ -6,7 +6,6 @@ import sys
 import time
 from dataclasses import replace
 
-from adapters.postgres.store import PostgresJobStore
 from core.stub_unit import (
     JOB_KIND_RUN,
     JOB_KIND_UNIT,
@@ -20,6 +19,7 @@ from core.stub_unit import (
     UnitJobLease,
     UnsupportedResultError,
 )
+from ports.job_store import JobStorePort
 
 IDLE_SLEEP_SECONDS = 0.5
 
@@ -31,7 +31,7 @@ _APPLY_ERRORS = (
 )
 
 
-def handle_unit(store: PostgresJobStore, lease: UnitJobLease, worker_id: str) -> int:
+def handle_unit(store: JobStorePort, lease: UnitJobLease, worker_id: str) -> int:
     """Unit stub: ready → start+complete; reclaimed running → complete only."""
     try:
         if lease.unit_state == STUB_READY:
@@ -74,7 +74,7 @@ def handle_unit(store: PostgresJobStore, lease: UnitJobLease, worker_id: str) ->
         return 1
 
 
-def handle_run(store: PostgresJobStore, lease: UnitJobLease, worker_id: str) -> int:
+def handle_run(store: JobStorePort, lease: UnitJobLease, worker_id: str) -> int:
     """Run stub: no Unit SM / event_log / outbox — release only."""
     del worker_id  # identity checked at claim; run stub does not apply
     cleared = store.release(lease.job_id, lease.lease_id)
@@ -85,7 +85,7 @@ def handle_run(store: PostgresJobStore, lease: UnitJobLease, worker_id: str) -> 
     return 1
 
 
-def dispatch(store: PostgresJobStore, lease: UnitJobLease, worker_id: str) -> int:
+def dispatch(store: JobStorePort, lease: UnitJobLease, worker_id: str) -> int:
     if lease.kind == JOB_KIND_UNIT:
         return handle_unit(store, lease, worker_id)
     if lease.kind == JOB_KIND_RUN:
@@ -95,7 +95,7 @@ def dispatch(store: PostgresJobStore, lease: UnitJobLease, worker_id: str) -> in
     return 1
 
 
-def claim_and_dispatch(store: PostgresJobStore, worker_id: str) -> int:
+def claim_and_dispatch(store: JobStorePort, worker_id: str) -> int:
     """One claim+dispatch. Exit: 0 ok, 1 error, 2 idle."""
     lease = store.lease_next(worker_id)
     if lease is None:
@@ -104,7 +104,7 @@ def claim_and_dispatch(store: PostgresJobStore, worker_id: str) -> int:
 
 
 def run_poll_loop(
-    store: PostgresJobStore,
+    store: JobStorePort,
     worker_id: str,
     *,
     once: bool = False,
