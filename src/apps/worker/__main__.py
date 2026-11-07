@@ -11,17 +11,34 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import timedelta
+from typing import Any
+
+import psycopg
 
 from adapters.postgres import PostgresJobStore, connect
+from adapters.postgres.store import LEASE_TTL
 from apps.worker.loop import claim_and_dispatch, run_poll_loop
 from apps.worker.reconcile import run_reconcile_tick
+
+
+def _lease_ttl_from_env() -> timedelta:
+    """Optional ``LEASE_TTL_SECONDS``; unset/empty keeps store default (90s)."""
+    raw = os.environ.get("LEASE_TTL_SECONDS")
+    if raw is None or raw.strip() == "":
+        return LEASE_TTL
+    return timedelta(seconds=float(raw))
+
+
+def _store(conn: psycopg.Connection[dict[str, Any]]) -> PostgresJobStore:
+    return PostgresJobStore(conn, lease_ttl=_lease_ttl_from_env())
 
 
 def run_once(worker_id: str | None = None) -> int:
     """One claim+dispatch then exit (seed / AGENT / ``--once``)."""
     worker_id = worker_id or os.environ.get("WORKER_ID", "worker-1")
     with connect() as conn:
-        store = PostgresJobStore(conn)
+        store = _store(conn)
         code = claim_and_dispatch(store, worker_id)
         if code == 2:
             print("no actionable job", file=sys.stderr)
@@ -32,7 +49,7 @@ def reconcile_once(worker_id: str | None = None) -> int:
     """One reconcile tick under try-lock then exit (0 locked pass, 2 lock miss)."""
     worker_id = worker_id or os.environ.get("WORKER_ID", "worker-1")
     with connect() as conn:
-        store = PostgresJobStore(conn)
+        store = _store(conn)
         result = run_reconcile_tick(store, worker_id)
         if not result.locked:
             print("reconcile lock not acquired", file=sys.stderr)
@@ -72,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(run_once(worker_id))
 
     with connect() as conn:
-        store = PostgresJobStore(conn)
+        store = _store(conn)
         raise SystemExit(run_poll_loop(store, worker_id, once=False))
 
 

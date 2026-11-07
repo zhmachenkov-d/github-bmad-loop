@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from dataclasses import replace
@@ -32,6 +33,14 @@ _APPLY_ERRORS = (
 )
 
 
+def _hold_seconds() -> float:
+    """Optional ``BMAD_WORKER_HOLD_SECONDS`` kill window; default 0 (off)."""
+    raw = os.environ.get("BMAD_WORKER_HOLD_SECONDS")
+    if raw is None or raw.strip() == "":
+        return 0.0
+    return float(raw)
+
+
 def handle_unit(store: JobStorePort, lease: UnitJobLease, worker_id: str) -> int:
     """Unit stub: ready → start+complete; reclaimed running → complete only."""
     try:
@@ -45,6 +54,9 @@ def handle_unit(store: JobStorePort, lease: UnitJobLease, worker_id: str) -> int
             if not store.heartbeat(lease.job_id, lease.lease_id, worker_id):
                 print("heartbeat lost after stub_start; stopping", file=sys.stderr)
                 return 1
+            hold = _hold_seconds()
+            if hold > 0:
+                time.sleep(hold)
             complete = store.apply_transition(lease, worker_id, STUB_COMPLETE)
             print(
                 f"applied {start.from_state}→{start.to_state} then "
